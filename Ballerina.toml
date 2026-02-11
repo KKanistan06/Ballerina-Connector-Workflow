@@ -1,0 +1,14 @@
+[package]
+org = "wso2"
+name = "connector_automation"
+version = "0.1.0"
+distribution = "2201.10.0"
+
+[build-options]
+observabilityIncluded = true
+
+[[platform.java21.dependency]]
+groupId = "io.ballerina.connector.automator.sdkanalyzer"
+artifactId = "native"
+version = "0.1.0"
+path = "./modules/sdkanalyzer/native/build/libs/native-0.1.0.jar"
