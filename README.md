@@ -1,4 +1,4 @@
-# JavaPhaser — AI-powered Ballerina connector automation
+# AI-powered Ballerina connector automation
 
 AI-powered automation that analyzes Java SDK JARs and produces structured metadata to help generate Ballerina connectors. The core analyzer is in `modules/sdkanalyzer`.
 
