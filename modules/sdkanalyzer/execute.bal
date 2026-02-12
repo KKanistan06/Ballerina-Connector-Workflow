@@ -86,7 +86,9 @@ function analyzeSDK(string sdkRef, string outputDir, AnalyzerConfig config) retu
 function parseCommandLineArgs(string[] args) returns AnalyzerConfig {
     AnalyzerConfig config = {};
 
-    foreach string arg in args {
+    int i = 0;
+    while i < args.length() {
+        string arg = args[i];
         match arg {
             "yes" | "--yes" | "-y" => {
                 config.autoYes = true;
@@ -103,8 +105,15 @@ function parseCommandLineArgs(string[] args) returns AnalyzerConfig {
             "include-non-public" | "--include-non-public" => {
                 config.includeNonPublic = true;
             }
+            "--sources" => {
+                // Next arg is the path to sources (if present)
+                if i + 1 < args.length() {
+                    config.sourcesPath = args[i + 1];
+                    i = i + 1;
+                }
+            }
             _ => {
-                // Handle key=value pairs
+                // Handle key=value pairs and --sources=path style
                 if arg.includes("=") {
                     string[] parts = regex:split(arg, "=");
                     if parts.length() == 2 {
@@ -132,6 +141,11 @@ function parseCommandLineArgs(string[] args) returns AnalyzerConfig {
                                     config.maxDependencyDepth = depth;
                                 }
                             }
+                            "--sources" => {
+                                if value.length() > 0 {
+                                    config.sourcesPath = value;
+                                }
+                            }
                             _ => {
                                 // Ignore unknown key=value pairs for forward compatibility.
                             }
@@ -140,6 +154,7 @@ function parseCommandLineArgs(string[] args) returns AnalyzerConfig {
                 }
             }
         }
+        i = i + 1;
     }
 
     return config;
@@ -181,6 +196,7 @@ function printUsage() {
     io:println("  --exclude-packages=   Comma-separated packages to exclude");
     io:println("  --include-packages=   Comma-separated packages to include (only these)");
     io:println("  --max-depth=N         Maximum dependency resolution depth (default: 3)");
+    io:println("  --sources <path>      Optional path to sources JAR or extracted sources directory") ;
     io:println();
     io:println("EXAMPLES:");
     io:println("  bal run -- analyze ./aws-sdk-s3.jar ./output");

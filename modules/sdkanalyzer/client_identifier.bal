@@ -246,6 +246,9 @@ public function generateStructuredMetadata(
     ClassInfo[] allClasses
 ) returns StructuredSDKMetadata {
     
+    // Track enums globally to avoid duplication
+    map<EnumMetadata> enumCache = {};
+    
     // Populate request fields for all parameters in the selected methods
     MethodInfo[] methodsWithRequestFields = [];
     foreach MethodInfo method in rankedMethods {
@@ -261,7 +264,31 @@ public function generateStructuredMetadata(
             if requestClass is ClassInfo {
                 // Replace the parameter's exposed type with the resolved Request class
                 updatedParam.typeName = requestClass.className;
-                updatedParam.requestFields = extractRequestFields(requestClass);
+                
+                // Extract request fields and check for enums
+                RequestFieldInfo[] fields = extractRequestFields(requestClass);
+                RequestFieldInfo[] enhancedFields = [];
+                
+                foreach RequestFieldInfo fieldInfo in fields {
+                    RequestFieldInfo enhancedField = fieldInfo;
+                    
+                    // Check if field type is an enum and extract enum values
+                    ClassInfo? enumClass = findClassByName(fieldInfo.fullType, allClasses);
+                    if enumClass is ClassInfo && enumClass.isEnum {
+                        // Check if already cached
+                        if !enumCache.hasKey(fieldInfo.fullType) {
+                            // Extract enum metadata
+                            EnumMetadata enumMeta = extractEnumMetadata(enumClass);
+                            enumCache[fieldInfo.fullType] = enumMeta;
+                        }
+                        // Set enum reference
+                        enhancedField.enumReference = fieldInfo.fullType;
+                    }
+                    
+                    enhancedFields.push(enhancedField);
+                }
+                
+                updatedParam.requestFields = enhancedFields;
 
                 // If the parameter name is generic (e.g., 'consumer'), replace it with a sensible name
                 if param.name.toLowerAscii().indexOf("consumer") != -1 || param.name.startsWith("arg") {
@@ -296,6 +323,7 @@ public function generateStructuredMetadata(
             methods: methodsWithRequestFields
         },
         supportingClasses: extractSupportingClasses(rankedMethods, allClasses),
+        enums: enumCache,
         analysis: {
             totalClassesFound: allClasses.length(),
             totalMethodsInClient: rootClient.methods.length(),
@@ -604,4 +632,71 @@ function detectClientInitPatternHeuristically(ClassInfo clientClass) returns Cli
         explanation: string:'join(" | ", ...patterns),
         detectedBy: "heuristic"
     };
+}
+# Enrich metadata with LLM-generated descriptions for methods, parameters, and fields
+#
+# + metadata - Base metadata structure
+# + sdkName - SDK name for context
+# + sdkVersion - SDK version
+# + config - Analyzer configuration
+# + return - Enriched metadata with descriptions
+public function enrichMetadataWithDescriptions(
+    StructuredSDKMetadata metadata,
+    string sdkName,
+    string sdkVersion,
+    AnalyzerConfig config
+) returns StructuredSDKMetadata|error {
+    
+    if config.disableLLM {
+        return metadata;
+    }
+    
+    StructuredSDKMetadata enrichedMetadata = metadata;
+    MethodInfo[] enrichedMethods = [];
+    
+    // Enrich each method with descriptions
+    foreach MethodInfo method in metadata.rootClient.methods {
+        MethodInfo enrichedMethod = method;
+        
+        // Enrich parameters
+        ParameterInfo[] enrichedParams = [];
+        foreach ParameterInfo param in enrichedMethod.parameters {
+            ParameterInfo enrichedParam = param;
+            
+            // If parameter has request fields, enrich them
+            RequestFieldInfo[]? fields = param.requestFields;
+            if fields is RequestFieldInfo[] && fields.length() > 0 {
+                RequestFieldInfo[] enrichedFields = [];
+                
+                // For now, skip LLM enrichment due to complexity - keep original fields
+                // TODO: Implement full LLM enrichment with proper JSON parsing
+                enrichedFields = fields;
+                
+                enrichedParam.requestFields = enrichedFields;
+            }
+            
+            enrichedParams.push(enrichedParam);
+        }
+        
+        enrichedMethod.parameters = enrichedParams;
+        enrichedMethods.push(enrichedMethod);
+    }
+    
+    // Update metadata with enriched methods
+    enrichedMetadata.rootClient.methods = enrichedMethods;
+    
+    return enrichedMetadata;
+}
+
+# Format parameter fields for LLM prompt
+#
+# + param - Parameter information
+# + fields - Request fields array
+# + return - Formatted parameter fields
+function formatParameterFieldsForLLM(ParameterInfo param, RequestFieldInfo[] fields) returns string {
+    string result = string `Parameter: ${param.name} (${param.typeName})\nFields:\n`;
+    foreach RequestFieldInfo fieldInfo in fields {
+        result += string `  - ${fieldInfo.name}: ${fieldInfo.typeName}\n`;
+    }
+    return result;
 }

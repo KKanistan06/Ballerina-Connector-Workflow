@@ -27,7 +27,9 @@ function getAnthropicConfig() returns AnthropicConfiguration|error {
     return {
         apiKey: apiKey,
         model: "claude-opus-4-1-20250805",
-        maxTokens: 4096
+        maxTokens: 4096,
+        temperature: 0,
+        enableExtendedThinking: false
     };
 }
 
@@ -41,9 +43,10 @@ function callAnthropicAPI(AnthropicConfiguration config, string systemPrompt, st
         timeout: 30
     });
     
-    json requestBody = {
+    map<json> bodyMap = {
         "model": config.model,
         "max_tokens": config.maxTokens,
+        "temperature": config.temperature,
         "messages": [
             {
                 "role": "user",
@@ -52,6 +55,16 @@ function callAnthropicAPI(AnthropicConfiguration config, string systemPrompt, st
         ],
         "system": systemPrompt
     };
+    
+    // Add extended thinking if enabled
+    if config.enableExtendedThinking {
+        bodyMap["thinking"] = {
+            "type": "enabled",
+            "budget_tokens": 5000
+        };
+    }
+    
+    json requestBody = bodyMap;
     
     map<string> headers = {
         "Content-Type": "application/json",

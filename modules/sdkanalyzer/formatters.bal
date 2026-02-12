@@ -37,115 +37,21 @@ public function formatClassInfoForLLM(ClassInfo cls) returns string {
     }
     
     return string `
-Class Name: ${cls.className}
-Simple Name: ${cls.simpleName}
-Package: ${cls.packageName}
-Is Interface: ${cls.isInterface}
-Is Abstract: ${cls.isAbstract}
-Is Deprecated: ${cls.isDeprecated}
-Total Methods: ${cls.methods.length()}
-Total Fields: ${cls.fields.length()}
-Super Class: ${superClassInfo}
+            Class Name: ${cls.className}
+            Simple Name: ${cls.simpleName}
+            Package: ${cls.packageName}
+            Is Interface: ${cls.isInterface}
+            Is Abstract: ${cls.isAbstract}
+            Is Deprecated: ${cls.isDeprecated}
+            Total Methods: ${cls.methods.length()}
+            Total Fields: ${cls.fields.length()}
+            Super Class: ${superClassInfo}
 
-Sample Methods (first 10):
-${methodList}
+            Sample Methods (first 10):
+            ${methodList}
 
-Constructors: ${cls.constructors.length()}
-Interfaces Implemented: ${cls.interfaces.length()}`;
-}
-
-# Format constructors for LLM context
-#
-# + constructors - Constructor list
-# + return - Formatted constructor info
-public function formatConstructorsForLLM(ConstructorInfo[] constructors) returns string {
-    if constructors.length() == 0 {
-        return "No public constructors found";
-    }
-    string[] constrStrings = [];
-    foreach ConstructorInfo c in constructors {
-        constrStrings.push(string `(${c.parameters.length()} params)`);
-    }
-    return "Constructors: " + joinStrings(constrStrings, ", ");
-}
-
-# Format methods for init pattern detection
-#
-# + methods - Method list
-# + maxMethods - Maximum number to show
-# + return - Formatted method info
-public function formatMethodsForInitPattern(MethodInfo[] methods, int maxMethods) returns string {
-    int count = methods.length() < maxMethods ? methods.length() : maxMethods;
-    string result = string `Key Methods (first ${maxMethods}):\n`;
-    foreach int i in 0 ..< count {
-        MethodInfo m = methods[i];
-        result = result + string `- ${m.name}()` + "\n";
-    }
-    return result;
-}
-
-# Format method list for LLM
-#
-# + methods - Methods to format
-# + maxMethods - Maximum number of methods to show
-# + return - Formatted method list
-public function formatMethodsForLLM(MethodInfo[] methods, int maxMethods) returns string {
-    int count = methods.length() < maxMethods ? methods.length() : maxMethods;
-    string result = "";
-    foreach int i in 0 ..< count {
-        MethodInfo m = methods[i];
-        result = result + string `- ${m.name}(${m.parameters.length()} params): ${m.returnType}` + "\n";
-    }
-    return result;
-}
-
-# Format methods for ranking
-#
-# + methods - Methods to format
-# + maxMethods - Max methods to show
-# + return - Formatted string
-public function formatMethodsForRanking(MethodInfo[] methods, int maxMethods) returns string {
-    int count = methods.length() < maxMethods ? methods.length() : maxMethods;
-    string result = "";
-    foreach int i in 0 ..< count {
-        MethodInfo method = methods[i];
-        string params = "";
-        foreach int j in 0 ..< method.parameters.length() {
-            params = params + method.parameters[j].name;
-            if j < method.parameters.length() - 1 {
-                params = params + ", ";
-            }
-        }
-        result = result + string `${i + 1}. ${method.name}(${params}) -> ${method.returnType}` + "\n";
-    }
-    return result;
-}
-
-# Format methods with details for LLM analysis
-#
-# + methods - Methods to format
-# + maxMethods - Maximum methods to include
-# + return - Formatted method details
-public function formatMethodsWithDetailsForLLM(MethodInfo[] methods, int maxMethods) returns string {
-    int count = methods.length() < maxMethods ? methods.length() : maxMethods;
-    string result = "";
-    
-    foreach int i in 0 ..< count {
-        MethodInfo m = methods[i];
-        string paramList = "";
-        
-        foreach int j in 0 ..< m.parameters.length() {
-            ParameterInfo p = m.parameters[j];
-            if j > 0 {
-                paramList = paramList + ", ";
-            }
-            paramList = paramList + p.name + ":" + p.typeName;
-        }
-        
-        result = result + string `${i + 1}. ${m.name}(${paramList}) -> ${m.returnType}\n`;
-    }
-    
-    return result;
+            Constructors: ${cls.constructors.length()}
+            Interfaces Implemented: ${cls.interfaces.length()}`;
 }
 
 # Format constructor details for init pattern detection

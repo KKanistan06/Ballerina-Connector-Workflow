@@ -122,3 +122,102 @@ public function getMethodRankingUserPrompt(int methodCount, string methodsList) 
         "Methods:\n" + methodsList + "\n" +
         "Important method names (comma-separated):";
 }
+
+# System prompt for parameter field analysis
+#
+# + return - System prompt for analyzing parameter fields
+public function getParameterFieldAnalysisSystemPrompt() returns string {
+    return "You are an expert Java SDK parameter analyzer with access to web search and official SDK documentation. " +
+        "Your task is to analyze method parameters and their fields to determine which fields are REQUIRED vs OPTIONAL, " +
+        "and provide human-readable descriptions for each. Use web search or SDK documentation to gather accurate information " +
+        "about parameter requirements and field purposes. Return your response as a structured JSON array.";
+}
+
+# User prompt for parameter field analysis
+#
+# + sdkName - SDK name (e.g., \"AWS S3 SDK\")
+# + sdkVersion - SDK version
+# + methodName - Method name being analyzed
+# + parameterInfo - Formatted parameter and field information
+# + return - User prompt for field analysis
+public function getParameterFieldAnalysisUserPrompt(
+    string sdkName,
+    string sdkVersion,
+    string methodName,
+    string parameterInfo
+) returns string {
+    return string `Analyze the following method parameter fields from ${sdkName} version ${sdkVersion}.
+
+Method: ${methodName}
+
+Parameter Information:
+${parameterInfo}
+
+For each field in each parameter, determine:
+1. **isRequired**: Whether the field is REQUIRED (true) or OPTIONAL (false) based on SDK documentation and web search
+2. **description**: A clear, human-readable description (1-2 sentences) explaining the field's purpose and usage
+
+Use web search or consult ${sdkName} documentation to ensure accuracy. Return a JSON array with this exact structure:
+
+[
+  {
+    "parameterName": "paramName",
+    "fields": [
+      {
+        "fieldName": "fieldName",
+        "isRequired": true/false,
+        "description": "Clear description of what this field does"
+      }
+    ]
+  }
+]
+
+Return ONLY the JSON array, no additional text.`;
+}
+
+# System prompt for method description generation
+#
+# + return - System prompt for generating method descriptions
+public function getMethodDescriptionSystemPrompt() returns string {
+    return "You are an expert technical writer specializing in SDK documentation. " +
+        "Generate clear, concise, human-readable descriptions for SDK methods and their parameters. " +
+        "Use web search and official documentation to ensure accuracy. Focus on practical usage and purpose.";
+}
+
+# User prompt for method description generation
+#
+# + sdkName - SDK name
+# + sdkVersion - SDK version  
+# + methodName - Method name
+# + methodSignature - Method signature with types
+# + return - User prompt for method description
+public function getMethodDescriptionUserPrompt(
+    string sdkName,
+    string sdkVersion,
+    string methodName,
+    string methodSignature
+) returns string {
+    return string `Generate documentation for this ${sdkName} v${sdkVersion} method.
+
+Method: ${methodName}
+Signature: ${methodSignature}
+
+Provide a JSON object with:
+1. **methodDescription**: Clear explanation (2-3 sentences) of what the method does and when to use it
+2. **parameters**: Array of parameter descriptions
+
+Use web search or ${sdkName} documentation for accuracy.
+
+JSON format:
+{
+  "methodDescription": "Description of the method",
+  "parameters": [
+    {
+      "parameterName": "name",
+      "description": "What this parameter represents"
+    }
+  ]
+}
+
+Return ONLY the JSON object.`;
+}

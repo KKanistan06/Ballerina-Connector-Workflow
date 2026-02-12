@@ -42,9 +42,10 @@ public function resolveSDKReference(string sdkRef) returns map<json>|error {
 # Parse JAR file and extract class information.
 # Supports both local JAR paths and Maven resolution results.
 #
-# + sdkRef - Maven coordinate or local JAR path
+# + sdkRef - Maven coordinate or local JAR path  
+# + sourcesPath - Optional path to sources JAR
 # + return - Array of class information or error
-public function parseJarFromReference(string sdkRef) returns ClassInfo[]|error {
+public function parseJarFromReference(string sdkRef, string? sourcesPath) returns ClassInfo[]|error {
     // Resolve the SDK reference (Maven or local)
     map<json>|error resolvedResult = resolveSDKReference(sdkRef);
     
@@ -54,6 +55,11 @@ public function parseJarFromReference(string sdkRef) returns ClassInfo[]|error {
     
     map<json> resolved = resolvedResult;
     
+    // Attach optional sources path if provided (native Java analyzer will handle extraction/parsing)
+    if sourcesPath != () {
+        resolved["sourcesPath"] = sourcesPath;
+    }
+
     // Call JavaParser-based Java method with resolved result
     json result = analyzeJarWithJavaParserExternal(resolved);
     
@@ -156,6 +162,31 @@ public function parseJarFromReference(string sdkRef) returns ClassInfo[]|error {
                         }
                         if !pMap.hasKey("requestFields") {
                             pMap["requestFields"] = [];
+                        } else {
+                            // Normalize requestFields to ensure typeName and fullType consistency
+                            json[] reqFields = <json[]> pMap["requestFields"];
+                            foreach json rf in reqFields {
+                                map<json> rfMap = <map<json>> rf;
+                                // Ensure typeName is set from "type" if needed
+                                if rfMap.hasKey("type") && !rfMap.hasKey("typeName") {
+                                    rfMap["typeName"] = rfMap["type"];
+                                }
+                                if !rfMap.hasKey("typeName") {
+                                    rfMap["typeName"] = rfMap.hasKey("type") ? rfMap["type"] : "";
+                                }
+                                if !rfMap.hasKey("fullType") {
+                                    rfMap["fullType"] = rfMap.hasKey("typeName") ? rfMap["typeName"] : "";
+                                }
+                                if !rfMap.hasKey("isRequired") {
+                                    rfMap["isRequired"] = false;
+                                }
+                                if !rfMap.hasKey("description") {
+                                    rfMap["description"] = null;
+                                }
+                                if !rfMap.hasKey("enumReference") {
+                                    rfMap["enumReference"] = null;
+                                }
+                            }
                         }
                     }
                 } else {

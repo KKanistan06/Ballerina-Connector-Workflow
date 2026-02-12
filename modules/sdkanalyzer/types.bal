@@ -98,6 +98,10 @@ public type AnalyzerConfig record {|
     string? apiClassName = ();
     # OpenAI API key for spec doc generation
     string openaiApiKey = "";
+    # Optional path to a sources JAR or extracted source directory
+    string? sourcesPath = ();
+    # Disable LLM calls for descriptions and enrichment
+    boolean disableLLM = false;
 |};
 
 # Client initialization pattern metadata
@@ -196,12 +200,16 @@ public type MethodMetadata record {|
 public type RequestFieldOutput record {|
     # Field name
     string name;
-    # Type name
+    # Type name (simple name, not fully qualified)
     string 'type;
     # Fully qualified type
     string fullType;
     # Whether this field is required
     boolean isRequired;
+    # Human-readable description of this field
+    string? description = ();
+    # Enum values if this field is an enum type (reference to cached enum)
+    string? enumReference = ();
 |};
 
 # Metadata for a method/constructor parameter.
@@ -212,6 +220,8 @@ public type ParameterMetadata record {|
     string paramType;
     # Simple type name
     string paramTypeSimple;
+    # Human-readable description of this parameter
+    string? description = ();
     # Request object fields (if this parameter is a Request class)
     RequestFieldOutput[]? requestFields = ();
 |};
@@ -247,10 +257,14 @@ public type ConstructorMetadata record {|
 type AnthropicConfiguration record {
     # API key for authentication
     string apiKey;
-    # Model to use for analysis (e.g., "claude-2")
+    # Model to use for analysis (e.g., "claude-opus-4-1-20250805")
     string model;
     # Maximum number of tokens for the API call
     int maxTokens;
+    # Temperature for response generation (0.0 = deterministic, higher = more creative)
+    decimal temperature;
+    # Enable extended thinking (deep research mode) for complex analysis
+    boolean enableExtendedThinking;
 };
 
 # Type hierarchy information.
@@ -517,6 +531,10 @@ public type RequestFieldInfo record {|
     string fullType;
     # Whether this field is required
     boolean isRequired;
+    # Human-readable description of this field
+    string? description = ();
+    # Enum values if this field is an enum type (reference to cached enum)
+    string? enumReference = ();
 |};
 
 # Root client class information
@@ -569,6 +587,24 @@ public type AnalysisSummary record {|
     string analysisApproach;
 |};
 
+# Enum value information
+public type EnumValueInfo record {|
+    # Enum constant name
+    string name;
+    # Enum ordinal value
+    int ordinal;
+|};
+
+# Enum metadata for referenced enum types
+public type EnumMetadata record {|
+    # Fully qualified enum class name
+    string enumClassName;
+    # Simple enum class name
+    string simpleName;
+    # Enum constant values
+    EnumValueInfo[] values;
+|};
+
 # Complete structured SDK metadata (final output)
 public type StructuredSDKMetadata record {|
     # SDK basic information
@@ -579,6 +615,8 @@ public type StructuredSDKMetadata record {|
     RootClientInfo rootClient;
     # Supporting classes used by the client
     SupportingClassInfo[] supportingClasses;
+    # Enum types referenced in parameters (keyed by fully qualified enum class name)
+    map<EnumMetadata> enums;
     # Analysis summary
     AnalysisSummary analysis;
 |};

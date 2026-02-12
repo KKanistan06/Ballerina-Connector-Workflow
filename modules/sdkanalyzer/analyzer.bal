@@ -88,7 +88,7 @@ public function analyzeJavaSDK(string jarPath, string outputDir, AnalyzerConfig 
         io:println("Step 1/7: Extracting and analyzing classes with JavaParser...");
     }
 
-    ClassInfo[]|AnalyzerError analysisResult = analyzeJarWithJavaParserWrapper(jarPath);
+    ClassInfo[]|AnalyzerError analysisResult = analyzeJarWithJavaParserWrapper(jarPath, config);
     if analysisResult is AnalyzerError {
         return analysisResult;
     }
@@ -258,7 +258,7 @@ public function analyzeJavaSDK(string jarPath, string outputDir, AnalyzerConfig 
         rootClient,
         clientInitPattern,
         selectedMethods,
-        filteredClasses
+        rawClasses  // Use all classes to find enums and request types
     );
 
     // Try to infer SDK version from the provided JAR path
@@ -342,12 +342,13 @@ function isRelevantClientClass(ClassInfo cls) returns boolean {
 
 # Wrapper function for JavaParser analysis
 #
-# + jarPath - Path to JAR file
+# + jarPath - Path to JAR file  
+# + config - Analyzer configuration (for sources path)
 # + return - Array of ClassInfo or error
-public function analyzeJarWithJavaParserWrapper(string jarPath) returns ClassInfo[]|AnalyzerError {
+public function analyzeJarWithJavaParserWrapper(string jarPath, AnalyzerConfig config) returns ClassInfo[]|AnalyzerError {
     // Call into the jar parser which wraps the Java interop implementation.
     // This supports both local JAR paths and Maven coordinates.
-    ClassInfo[]|error res = parseJarFromReference(jarPath);
+    ClassInfo[]|error res = parseJarFromReference(jarPath, config.sourcesPath);
     if res is error {
         // Convert generic error to AnalyzerError alias
         return <AnalyzerError> res;
@@ -443,15 +444,24 @@ function prettyPrintJson(json v, int indent) returns string {
             return "{}";
         }
         string out = "{\n";
+        int writtenFields = 0;
         foreach int i in 0 ..< keys.length() {
             string k = keys[i];
             json val = m[k];
-            out += indentString(indent + 1) + "\"" + k + "\": " + prettyPrintJson(val, indent + 1);
-            if i < keys.length() - 1 {
-                out += ",\n";
-            } else {
-                out += "\n";
+            
+            // Skip enumReference and description if they are null
+            if (k == "enumReference" || k == "description") && val is () {
+                continue;
             }
+            
+            if writtenFields > 0 {
+                out += ",\n";
+            }
+            out += indentString(indent + 1) + "\"" + k + "\": " + prettyPrintJson(val, indent + 1);
+            writtenFields += 1;
+        }
+        if writtenFields > 0 {
+            out += "\n";
         }
         out += indentString(indent) + "}";
         return out;

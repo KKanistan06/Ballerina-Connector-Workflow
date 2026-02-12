@@ -183,9 +183,12 @@ public function extractRequestFields(ClassInfo requestClass) returns RequestFiel
                 fieldName = firstChar + fieldName.substring(1);
             }
 
+            // Extract simple type name from fully qualified type
+            string simpleTypeName = extractSimpleTypeName(method.returnType);
+
             RequestFieldInfo fieldInfo = {
                 name: fieldName,
-                typeName: method.returnType,
+                typeName: simpleTypeName,
                 fullType: method.returnType,
                 isRequired: false
             };
@@ -195,6 +198,21 @@ public function extractRequestFields(ClassInfo requestClass) returns RequestFiel
     }
 
     return requestFields;
+}
+
+# Extract simple type name from fully qualified name
+#
+# + fullTypeName - Fully qualified type name
+# + return - Simple type name (last component)
+function extractSimpleTypeName(string fullTypeName) returns string {
+    if fullTypeName == "" {
+        return "";
+    }
+    int? lastDot = fullTypeName.lastIndexOf(".");
+    if lastDot is int && lastDot >= 0 {
+        return fullTypeName.substring(lastDot + 1);
+    }
+    return fullTypeName;
 }
 
 # Enhance parameters with resolved request class information
@@ -231,4 +249,31 @@ public function isSimpleType(string typeName) returns boolean {
            typeName == "String" || typeName == "double" || typeName == "float" ||
            typeName == "byte" || typeName == "char" || typeName == "short" ||
            typeName == "java.lang.String" || typeName == "java.lang.Object";
+}
+
+# Extract enum metadata from an enum class
+#
+# + enumClass - The enum ClassInfo
+# + return - Enum metadata with values
+public function extractEnumMetadata(ClassInfo enumClass) returns EnumMetadata {
+    EnumValueInfo[] values = [];
+    
+    // Extract enum constants from static final fields
+    int ordinal = 0;
+    foreach FieldInfo fieldInfo in enumClass.fields {
+        if fieldInfo.isStatic && fieldInfo.isFinal && fieldInfo.typeName == enumClass.className {
+            EnumValueInfo enumValue = {
+                name: fieldInfo.name,
+                ordinal: ordinal
+            };
+            values.push(enumValue);
+            ordinal = ordinal + 1;
+        }
+    }
+    
+    return {
+        enumClassName: enumClass.className,
+        simpleName: enumClass.simpleName,
+        values: values
+    };
 }

@@ -23,6 +23,8 @@ import com.github.javaparser.ast.Modifier;
 import com.github.javaparser.ast.NodeList;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.ConstructorDeclaration;
+import com.github.javaparser.ast.body.EnumConstantDeclaration;
+import com.github.javaparser.ast.body.EnumDeclaration;
 import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.Parameter;
@@ -127,8 +129,20 @@ public class JavaParserAnalyzer {
             
             // 2. Extract source files and analyze with JavaParser
             List<BMap<BString, Object>> classes = new ArrayList<>();
-            Map<String, CompilationUnit> parsedSources = extractAndParseSourceFiles(jarFiles);
-            
+
+            // Check for explicit sourcesPath in the resolution map (if provided)
+            String explicitSourcesPath = null;
+            if (jarPathOrResult instanceof BMap) {
+                BMap<BString, Object> mavenResult = (BMap<BString, Object>) jarPathOrResult;
+                Object sourcesObj = mavenResult.get(StringUtils.fromString("sourcesPath"));
+                if (sourcesObj != null) {
+                    explicitSourcesPath = sourcesObj.toString();
+                }
+            }
+
+            Map<String, CompilationUnit> parsedSources = extractAndParseSourceFiles(jarFiles, explicitSourcesPath);
+
+            System.err.println("DEBUG: explicitSourcesPath=" + explicitSourcesPath);
             System.err.println("INFO: Parsed " + parsedSources.size() + " source files");
             
             // 3. For each class, create metadata using JavaParser + ASM fallback
@@ -196,34 +210,104 @@ public class JavaParserAnalyzer {
      * @param jarFiles List of JAR files
      * @return Map of class name to CompilationUnit
      */
-    private static Map<String, CompilationUnit> extractAndParseSourceFiles(List<File> jarFiles) {
+    private static Map<String, CompilationUnit> extractAndParseSourceFiles(List<File> jarFiles, String sourcesPath) {
         Map<String, CompilationUnit> parsedSources = new HashMap<>();
-        
+
         // Configure JavaParser with basic settings
         ParserConfiguration config = new ParserConfiguration();
         config.setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_17);
-        
+
         JavaParser javaParser = new JavaParser(config);
-        
-        // Extract source files from JARs
+
+        // 1) Extract .java from provided sourcesPath (if any)
+        if (sourcesPath != null && !sourcesPath.isBlank()) {
+            File sp = new File(sourcesPath);
+            if (sp.exists()) {
+                if (sp.isDirectory()) {
+                    // Walk directory for .java files
+                    try {
+                        java.nio.file.Files.walk(sp.toPath())
+                                .filter(p -> p.toString().endsWith(".java"))
+                                .forEach(p -> {
+                                    try {
+                                            String content = java.nio.file.Files.readString(p);
+                                            CompilationUnit cu = javaParser.parse(content).getResult().orElse(null);
+                                            if (cu != null) {
+                                                // Derive a fallback path from the file path relative to the sources root
+                                                String fallbackPath = sp.toPath().relativize(p).toString().replace(java.io.File.separatorChar, '/');
+                                                String className = extractClassNameFromCU(cu, fallbackPath);
+                                                if (className != null) {
+                                                    parsedSources.put(className, cu);
+                                                }
+                                            }
+                                    } catch (Exception e) {
+                                        System.err.println("WARNING: Failed to parse source file " + p + ": " + e.getMessage());
+                                    }
+                                });
+                    } catch (IOException e) {
+                        System.err.println("WARNING: Failed to read sources directory: " + sp.getAbsolutePath());
+                    }
+                } else if (sp.isFile() && sp.getName().endsWith(".jar")) {
+                    // Read .java entries from the provided sources JAR
+                    try (JarFile srcJar = new JarFile(sp)) {
+                        Enumeration<JarEntry> entries = srcJar.entries();
+                        while (entries.hasMoreElements()) {
+                            JarEntry entry = entries.nextElement();
+                            String entryName = entry.getName();
+                                if (entryName.endsWith(".java")) {
+                                System.err.println("DEBUG: Found source entry: " + entryName);
+                                try (InputStream inputStream = srcJar.getInputStream(entry)) {
+                                    String content = new String(inputStream.readAllBytes());
+                                    try {
+                                        var parseResult = javaParser.parse(content);
+                                        Optional<CompilationUnit> opt = parseResult.getResult();
+                                        if (opt.isPresent()) {
+                                            CompilationUnit cu = opt.get();
+                                            // Use the jar entry path as a fallback if JavaParser doesn't provide a primary type
+                                            String className = extractClassNameFromCU(cu, entryName);
+                                            if (className != null) {
+                                                parsedSources.put(className, cu);
+                                                System.err.println("DEBUG: Parsed source for class: " + className);
+                                            } else {
+                                                System.err.println("DEBUG: Parsed but could not determine class name for: " + entryName);
+                                            }
+                                        } else {
+                                            System.err.println("WARNING: parse returned empty for " + entryName + ", problems=" + parseResult.getProblems());
+                                        }
+                                    } catch (Exception e) {
+                                        System.err.println("WARNING: Failed to parse " + entryName + ": " + e.getMessage());
+                                    }
+                                }
+                            }
+                        }
+                    } catch (IOException e) {
+                        System.err.println("WARNING: Failed to read sources JAR: " + sp.getName());
+                    }
+                }
+            } else {
+                System.err.println("INFO: sourcesPath provided but not found: " + sourcesPath);
+            }
+        }
+
+        // 2) Fallback: Extract .java files that may be present inside the main JARs
         for (File jarFile : jarFiles) {
             try (JarFile jar = new JarFile(jarFile)) {
                 Enumeration<JarEntry> entries = jar.entries();
-                
+
                 while (entries.hasMoreElements()) {
                     JarEntry entry = entries.nextElement();
                     String entryName = entry.getName();
-                    
+
                     // Look for .java files
                     if (entryName.endsWith(".java")) {
                         try (InputStream inputStream = jar.getInputStream(entry)) {
                             String content = new String(inputStream.readAllBytes());
-                            
+
                             try {
                                 CompilationUnit cu = javaParser.parse(content).getResult().orElse(null);
                                 if (cu != null) {
-                                    // Extract class name from compilation unit
-                                    String className = extractClassNameFromCU(cu);
+                                    // Extract class name from compilation unit; use jar entry as fallback
+                                    String className = extractClassNameFromCU(cu, entryName);
                                     if (className != null) {
                                         parsedSources.put(className, cu);
                                     }
@@ -238,7 +322,7 @@ public class JavaParserAnalyzer {
                 System.err.println("WARNING: Failed to read JAR: " + jarFile.getName());
             }
         }
-        
+
         return parsedSources;
     }
     
@@ -248,16 +332,38 @@ public class JavaParserAnalyzer {
      * @param cu CompilationUnit
      * @return Fully qualified class name
      */
-    private static String extractClassNameFromCU(CompilationUnit cu) {
+    private static String extractClassNameFromCU(CompilationUnit cu, String fallbackPath) {
         Optional<String> packageName = cu.getPackageDeclaration()
                 .map(pd -> pd.getNameAsString());
-        
+
         Optional<TypeDeclaration<?>> primaryType = cu.getPrimaryType();
         if (primaryType.isPresent()) {
             String className = primaryType.get().getNameAsString();
             return packageName.map(pkg -> pkg + "." + className).orElse(className);
         }
-        
+
+        // If no primary type, try to derive from the fallbackPath (jar entry or relative path)
+        if (fallbackPath != null && !fallbackPath.isBlank()) {
+            String candidate = fallbackPath.replace('/', '.');
+            if (candidate.endsWith(".java")) {
+                candidate = candidate.substring(0, candidate.length() - 5);
+            }
+            // If package declaration exists, prefer it (handles cases where file is nested differently)
+            if (packageName.isPresent()) {
+                // If candidate already contains package, return it; otherwise combine
+                if (candidate.startsWith(packageName.get())) {
+                    return candidate;
+                } else {
+                    // Use simple name from candidate if present
+                    int lastDot = candidate.lastIndexOf('.');
+                    String simple = lastDot >= 0 ? candidate.substring(lastDot + 1) : candidate;
+                    return packageName.get() + "." + simple;
+                }
+            }
+
+            return candidate;
+        }
+
         return null;
     }
     
@@ -316,13 +422,29 @@ public class JavaParserAnalyzer {
         
         MapType mapType = TypeCreator.createMapType(PredefinedTypes.TYPE_JSON);
         
-        // Find the primary class/interface declaration
-        Optional<TypeDeclaration<?>> primaryType = cu.getPrimaryType();
-        if (primaryType.isEmpty()) {
-            return null;
+        // Try to locate the relevant top-level type declaration.
+        // Prefer a type whose simple name matches the className argument, fall back to primary type,
+        // then the first top-level type if available.
+        String simpleName = className.contains(".") ? className.substring(className.lastIndexOf('.') + 1) : className;
+        TypeDeclaration<?> typeDecl = null;
+
+        for (TypeDeclaration<?> td : cu.getTypes()) {
+            if (td.getNameAsString().equals(simpleName)) {
+                typeDecl = td;
+                break;
+            }
         }
-        
-        TypeDeclaration<?> typeDecl = primaryType.get();
+
+        if (typeDecl == null) {
+            Optional<TypeDeclaration<?>> primaryType = cu.getPrimaryType();
+            if (primaryType.isPresent()) {
+                typeDecl = primaryType.get();
+            } else if (!cu.getTypes().isEmpty()) {
+                typeDecl = cu.getTypes().get(0);
+            } else {
+                return null;
+            }
+        }
         
         // Basic type information
         classInfo.put(StringUtils.fromString("isInterface"), typeDecl.isClassOrInterfaceDeclaration() && 
@@ -330,6 +452,60 @@ public class JavaParserAnalyzer {
         classInfo.put(StringUtils.fromString("isAbstract"), typeDecl.hasModifier(Modifier.Keyword.ABSTRACT));
         classInfo.put(StringUtils.fromString("isEnum"), typeDecl.isEnumDeclaration());
         classInfo.put(StringUtils.fromString("isDeprecated"), typeDecl.isAnnotationPresent("Deprecated"));
+        
+        // Handle enum types
+        if (typeDecl.isEnumDeclaration()) {
+            EnumDeclaration enumDecl = typeDecl.asEnumDeclaration();
+            
+            // Extract enum constants
+            List<BMap<BString, Object>> fields = new ArrayList<>();
+            for (EnumConstantDeclaration enumConst : enumDecl.getEntries()) {
+                BMap<BString, Object> fieldInfo = ValueCreator.createMapValue(mapType);
+                fieldInfo.put(StringUtils.fromString("name"), StringUtils.fromString(enumConst.getNameAsString()));
+                fieldInfo.put(StringUtils.fromString("type"), StringUtils.fromString(className));
+                fieldInfo.put(StringUtils.fromString("isStatic"), true);
+                fieldInfo.put(StringUtils.fromString("isFinal"), true);
+                fieldInfo.put(StringUtils.fromString("isDeprecated"), enumConst.isAnnotationPresent("Deprecated"));
+                
+                // Javadoc for enum constant
+                Optional<JavadocComment> javadoc = enumConst.getJavadocComment();
+                if (javadoc.isPresent()) {
+                    fieldInfo.put(StringUtils.fromString("javadoc"), 
+                            StringUtils.fromString(javadoc.get().getContent()));
+                } else {
+                    fieldInfo.put(StringUtils.fromString("javadoc"), null);
+                }
+                
+                fields.add(fieldInfo);
+            }
+            
+            classInfo.put(StringUtils.fromString("fields"),
+                    ValueCreator.createArrayValue(fields.toArray(new BMap[0]), 
+                    TypeCreator.createArrayType(mapType)));
+            
+            // Enums don't have constructors or methods we care about for this use case
+            classInfo.put(StringUtils.fromString("methods"),
+                    ValueCreator.createArrayValue(new BMap[0], 
+                    TypeCreator.createArrayType(mapType)));
+            classInfo.put(StringUtils.fromString("constructors"),
+                    ValueCreator.createArrayValue(new BMap[0], 
+                    TypeCreator.createArrayType(mapType)));
+            
+            classInfo.put(StringUtils.fromString("superClass"), null);
+            classInfo.put(StringUtils.fromString("interfaces"), ValueCreator.createArrayValue(new BString[0]));
+            
+            // Annotations
+            String[] annotations = enumDecl.getAnnotations().stream()
+                    .map(ann -> ann.getNameAsString())
+                    .toArray(String[]::new);
+            BString[] annotationsB = new BString[annotations.length];
+            for (int i = 0; i < annotations.length; i++) {
+                annotationsB[i] = StringUtils.fromString(annotations[i]);
+            }
+            classInfo.put(StringUtils.fromString("annotations"), ValueCreator.createArrayValue(annotationsB));
+            
+            return classInfo;
+        }
         
         if (typeDecl.isClassOrInterfaceDeclaration()) {
             ClassOrInterfaceDeclaration classDecl = typeDecl.asClassOrInterfaceDeclaration();
@@ -635,6 +811,8 @@ public class JavaParserAnalyzer {
         private final List<BMap<BString, Object>> methods = new ArrayList<>();
         private final List<BMap<BString, Object>> fields = new ArrayList<>();
         private final List<BMap<BString, Object>> constructors = new ArrayList<>();
+        private boolean isEnum = false;
+        private String enumClassName = "";
         
         public ASMClassAnalyzer(BMap<BString, Object> classInfo, MapType mapType) {
             super(Opcodes.ASM9);
@@ -649,11 +827,12 @@ public class JavaParserAnalyzer {
             // Class type information
             boolean isInterface = (access & Opcodes.ACC_INTERFACE) != 0;
             boolean isAbstract = (access & Opcodes.ACC_ABSTRACT) != 0;
-            boolean isEnum = (access & Opcodes.ACC_ENUM) != 0;
+            this.isEnum = (access & Opcodes.ACC_ENUM) != 0;
+            this.enumClassName = name.replace('/', '.');
             
             classInfo.put(StringUtils.fromString("isInterface"), isInterface);
             classInfo.put(StringUtils.fromString("isAbstract"), isAbstract);
-            classInfo.put(StringUtils.fromString("isEnum"), isEnum);
+            classInfo.put(StringUtils.fromString("isEnum"), this.isEnum);
             
             // Superclass
             if (superName != null && !superName.equals("java/lang/Object")) {
@@ -669,6 +848,28 @@ public class JavaParserAnalyzer {
                 interfaceNames[i] = StringUtils.fromString(interfaces[i].replace('/', '.'));
             }
             classInfo.put(StringUtils.fromString("interfaces"), ValueCreator.createArrayValue(interfaceNames));
+        }
+        
+        @Override
+        public org.objectweb.asm.FieldVisitor visitField(int access, String name, String descriptor, 
+                String signature, Object value) {
+            
+            // For enums, extract enum constants (public static final fields of the enum type)
+            if (isEnum && (access & Opcodes.ACC_PUBLIC) != 0 && 
+                (access & Opcodes.ACC_STATIC) != 0 && (access & Opcodes.ACC_FINAL) != 0 &&
+                (access & Opcodes.ACC_ENUM) != 0) {
+                
+                BMap<BString, Object> fieldInfo = ValueCreator.createMapValue(mapType);
+                fieldInfo.put(StringUtils.fromString("name"), StringUtils.fromString(name));
+                fieldInfo.put(StringUtils.fromString("type"), StringUtils.fromString(enumClassName));
+                fieldInfo.put(StringUtils.fromString("isStatic"), true);
+                fieldInfo.put(StringUtils.fromString("isFinal"), true);
+                fieldInfo.put(StringUtils.fromString("isDeprecated"), false);
+                fieldInfo.put(StringUtils.fromString("javadoc"), null);
+                fields.add(fieldInfo);
+            }
+            
+            return null;
         }
         
         @Override
