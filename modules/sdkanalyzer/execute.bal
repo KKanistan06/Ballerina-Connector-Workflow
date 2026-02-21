@@ -20,7 +20,7 @@ import ballerina/time;
 
 # Execute SDK Analyzer from command-line arguments.
 #
-# + args - Command-line arguments [sdk-ref, output-dir, options...]
+# + args - Command-line arguments [sdk-jar, javadoc-jar, output-dir, options...]
 # + return - Error if execution fails
 public function executeSdkAnalyzer(string... args) returns error? {
     string[] actualArgs = args;
@@ -28,15 +28,26 @@ public function executeSdkAnalyzer(string... args) returns error? {
         actualArgs = args.slice(1);
     }
 
-    if actualArgs.length() < 2 {
+    if actualArgs.length() < 3 {
         printUsage();
         return;
     }
 
     string sdkRef = actualArgs[0];
-    string outputDir = actualArgs[1];
+    string javadocJar = actualArgs[1];
+    string outputDir = actualArgs[2];
 
-    AnalyzerConfig config = parseCommandLineArgs(actualArgs.slice(2));
+    // Validate outputDir to avoid accidental key=value or flag usage
+    if outputDir.includes("=") || outputDir.startsWith("-") {
+        io:println("Invalid output-dir argument. It looks like you passed a flag or key=value pair instead of a directory path.");
+        printUsage();
+        return;
+    }
+
+    AnalyzerConfig config = parseCommandLineArgs(actualArgs.slice(3));
+    
+    // Set the javadoc path from the required argument
+    config.javadocPath = javadocJar;
 
     if !config.quietMode {
         log:printInfo("Starting SDK analysis", sdkRef = sdkRef, outputDir = outputDir);
@@ -112,6 +123,13 @@ function parseCommandLineArgs(string[] args) returns AnalyzerConfig {
                     i = i + 1;
                 }
             }
+            "--javadoc" => {
+                // Next arg is the path to javadoc JAR (if present)
+                if i + 1 < args.length() {
+                    config.javadocPath = args[i + 1];
+                    i = i + 1;
+                }
+            }
             _ => {
                 // Handle key=value pairs and --sources=path style
                 if arg.includes("=") {
@@ -141,9 +159,20 @@ function parseCommandLineArgs(string[] args) returns AnalyzerConfig {
                                     config.maxDependencyDepth = depth;
                                 }
                             }
-                            "--sources" => {
+                            "methods-to-list" | "--methods-to-list" => {
+                                int|error m = int:fromString(value);
+                                if m is int {
+                                    config.methodsToList = m;
+                                }
+                            }
+                            "sources" | "--sources" => {
                                 if value.length() > 0 {
                                     config.sourcesPath = value;
+                                }
+                            }
+                            "javadoc" | "--javadoc" => {
+                                if value.length() > 0 {
+                                    config.javadocPath = value;
                                 }
                             }
                             _ => {
@@ -178,35 +207,29 @@ function createSeparator(string char, int length) returns string {
 # Print usage information.
 function printUsage() {
     io:println();
-    io:println("SDK Analyzer - Extract metadata/IR from Java SDK JAR files (and Maven artifacts)");
+    io:println("SDK Analyzer - Extract metadata/IR from Java SDK JAR files");
     io:println();
     io:println("USAGE:");
-    io:println("  bal run -- analyze <sdk-ref> <output-dir> [options]");
+    io:println("  bal run -- analyze <sdk-jar> <javadoc-jar> <output-dir> [options]");
     io:println();
     io:println("ARGUMENTS:");
-    io:println("  sdk-ref               Path to a Java SDK JAR file, OR mvn:groupId:artifactId:version");
+    io:println("  sdk-jar               Path to the Java SDK JAR file");
+    io:println("  javadoc-jar           Path to the corresponding javadoc JAR file");
     io:println("  output-dir            Directory to save generated files");
     io:println();
     io:println("OPTIONS:");
-    io:println("  --yes, -y             Auto-confirm all prompts");
-    io:println("  --quiet, -q           Minimal logging output");
-    io:println("  --include-deprecated  Include deprecated methods/classes");
-    io:println("  --include-internal    Include internal packages (sun.*, com.sun.* etc.)");
-    io:println("  --include-non-public  Include protected/private members");
-    io:println("  --exclude-packages=   Comma-separated packages to exclude");
-    io:println("  --include-packages=   Comma-separated packages to include (only these)");
-    io:println("  --max-depth=N         Maximum dependency resolution depth (default: 3)");
-    io:println("  --sources <path>      Optional path to sources JAR or extracted sources directory") ;
+    io:println("  yes                   Auto-confirm all prompts");
+    io:println("  quiet                 Minimal logging output");
+    io:println("  include-deprecated    Include deprecated methods/classes");
+    io:println("  exclude-packages=     Comma-separated packages to exclude");
+    io:println("  methods-to-list=N     Number of top-ranked methods to include (default: 5)");
     io:println();
     io:println("EXAMPLES:");
-    io:println("  bal run -- analyze ./aws-sdk-s3.jar ./output");
-    io:println("  bal run -- analyze mvn:software.amazon.awssdk:s3:2.21.0 ./output --yes");
-    io:println("  bal run -- analyze ./sdk.jar ./output --yes --quiet");
-    io:println("  bal run -- analyze ./sdk.jar ./output --exclude-packages=internal,impl");
-    io:println("  bal run -- analyze ./sdk.jar ./output --include-packages=com.example.api");
+    io:println("  bal run -- analyze ./s3-2.25.16.jar ./s3-2.25.16-javadoc.jar ./output");
+    io:println("  bal run -- analyze ./sdk.jar ./sdk-javadoc.jar ./output yes quiet");
     io:println();
-    io:println("OUTPUT (minimum):");
-    io:println("  - sdk-metadata.json   Complete SDK metadata/IR for downstream generation");
-    io:println("  - analysis-report.txt Analysis summary report");
+    io:println("OUTPUT:");
+    io:println("  - <client>-metadata.json   Complete SDK metadata for downstream generation");
+    io:println("  - analysis-report.txt      Analysis summary report");
     io:println();
 }

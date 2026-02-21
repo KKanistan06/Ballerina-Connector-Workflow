@@ -19,33 +19,9 @@ import ballerina/io;
 import ballerina/regex;
 import ballerina/time;
 
-# Extract SDK version from JAR path
-# 
-# + jarPath - Path to JAR file
-# + return - Extracted version string or "unknown"
-function extractSdkVersion(string jarPath) returns string {
-    string[] pathParts = regex:split(jarPath, "/");
-    string filename = pathParts[pathParts.length() - 1];
-
-    // Remove .jar extension
-    if filename.endsWith(".jar") {
-        filename = filename.substring(0, filename.length() - 4);
-    }
-
-    // Look for version-like segments (numbers with dots)
-    string[] parts = regex:split(filename, "-");
-    foreach string part in parts.reverse() {
-        if regex:matches(part, "^[0-9]+\\.[0-9]+.*") {
-            return part;
-        }
-    }
-
-    return "unknown";
-}
-
 # Main function that analyzes a Java SDK JAR file using JavaParser approach.
 #
-# + jarPath - Path to the JAR file
+# + jarPath - Path to the JAR file (local filesystem path)
 # + outputDir - Output directory for metadata and reports
 # + config - Analyzer configuration
 # + return - Analysis result or error
@@ -85,25 +61,33 @@ public function analyzeJavaSDK(string jarPath, string outputDir, AnalyzerConfig 
 
     // Step 3: Extract and analyze classes using JavaParser
     if !config.quietMode {
-        io:println("Step 1/7: Extracting and analyzing classes with JavaParser...");
+        io:println("Step 1/7: Extracting classes...");
     }
 
-    ClassInfo[]|AnalyzerError analysisResult = analyzeJarWithJavaParserWrapper(jarPath, config);
+    ParsedJarResult|AnalyzerError analysisResult = analyzeJarWithDependencies(jarPath, config);
     if analysisResult is AnalyzerError {
         return analysisResult;
     }
-    ClassInfo[] rawClasses = analysisResult;
+    ClassInfo[] rawClasses = analysisResult.classes;
+    string[] dependencyJarPaths = analysisResult.dependencyJarPaths;
 
     if !config.quietMode {
-        io:println(string `Found ${rawClasses.length()} classes to analyze`);
+        io:println(string `  → Found ${rawClasses.length()} classes`);
+        if dependencyJarPaths.length() > 1 {
+            io:println(string `  → ${dependencyJarPaths.length()} dependency JARs available for class resolution`);
+        }
     }
 
-    // Write the full list of extracted classes to a file for easier inspection.
+    // Write the full list of extracted classes to a file for easier inspection
+    // (avoids noisy stdout for large JARs).
     check writeClassList(outputDir, rawClasses);
+
+    // Note: filteredClasses is built after structural filtering below; writeFilteredClassList
+    // will be called after the filter step so we can inspect the actual filtered set.
 
     // Step 4: Filter relevant classes for client identification
     if !config.quietMode {
-        io:println("Step 2/7: Filtering relevant classes...");
+        io:println("Step 2/7: Filtering classes...");
     }
 
     ClassInfo[] filteredClasses = [];
@@ -114,7 +98,7 @@ public function analyzeJavaSDK(string jarPath, string outputDir, AnalyzerConfig 
     }
 
     if !config.quietMode {
-        io:println(string `Filtered to ${filteredClasses.length()} relevant client classes`);
+        io:println(string `  → ${filteredClasses.length()} relevant client classes`);
     }
 
     if filteredClasses.length() == 0 {
@@ -126,7 +110,7 @@ public function analyzeJavaSDK(string jarPath, string outputDir, AnalyzerConfig 
 
     // Step 5: Identify root client class using LLM with weighted scoring
     if !config.quietMode {
-        io:println("Step 3/7: Identifying root client class with LLM...");
+        io:println("Step 3/7: Identifying root client...");
     }
 
     // Increase candidate shortlist to give the LLM more options for side-by-side comparison
@@ -138,19 +122,9 @@ public function analyzeJavaSDK(string jarPath, string outputDir, AnalyzerConfig 
     // Get top 5 candidates with scores
     [ClassInfo, LLMClientScore][] topCandidates = clientResult;
     
-    if !config.quietMode && topCandidates.length() > 0 {
-        io:println("\nTop 5 Client Candidates (with weighted scores):");
-        foreach int i in 0 ..< topCandidates.length() {
-            [ClassInfo, LLMClientScore] [cls, score] = topCandidates[i];
-            io:println(string `  ${i + 1}. ${cls.simpleName} (Score: ${score.totalScore}/100)`);
-            io:println(string `     Package: ${cls.packageName}`);
-            io:println(string `     Methods: ${cls.methods.length()}`);
-        }
-        io:println();
-    }
-    
     // Select the top LLM-scored candidate as the root client (LLM-only decision)
-    // We focus on sync clients. If there are tied scores, we will apply a heuristic to prefer sync clients.
+    // We focus on sync clients by preferring candidates whose simpleName does NOT contain "Async".
+    // Find the highest-scored sync candidate (if any) and use its score as the topScore grouping.
     int syncIndex = -1;
     foreach int i in 0 ..< topCandidates.length() {
         ClassInfo c = <ClassInfo> topCandidates[i][0];
@@ -199,6 +173,7 @@ public function analyzeJavaSDK(string jarPath, string outputDir, AnalyzerConfig 
         ClassInfo? bestCls = null;
         foreach var t in tied {
             ClassInfo c = <ClassInfo> t[0];
+            // LLMClientScore s = <LLMClientScore> t[1];
             if c.methods.length() > bestMethods {
                 bestMethods = c.methods.length();
                 bestCls = c;
@@ -207,20 +182,21 @@ public function analyzeJavaSDK(string jarPath, string outputDir, AnalyzerConfig 
         if bestCls is ClassInfo {
             rootClient = bestCls;
         } else {
+            // Fallback to the first candidate
             rootClient = topCandidates[0][0];
         }
     }
 
     if !config.quietMode {
-        io:println(string `Identified root client: ${rootClient.className}`);
+        io:println(string `  → Root client: ${rootClient.simpleName}`);
     }
 
     // Step 6: Detect client initialization pattern (LLM-only)
     if !config.quietMode {
-        io:println("Step 4/7: Detecting client initialization pattern...");
+        io:println("Step 4/7: Detecting init pattern...");
     }
 
-    ClientInitPattern|AnalyzerError clientInitResult = detectClientInitPatternWithLLM(rootClient);
+    ClientInitPattern|AnalyzerError clientInitResult = detectClientInitPatternWithLLM(rootClient, rawClasses, dependencyJarPaths);
     if clientInitResult is AnalyzerError {
         return clientInitResult;
     }
@@ -228,19 +204,19 @@ public function analyzeJavaSDK(string jarPath, string outputDir, AnalyzerConfig 
 
     // Step 7: Extract public methods from root client
     if !config.quietMode {
-        io:println("Step 5/7: Extracting public methods...");
+        io:println("Step 5/7: Extracting methods...");
     }
 
     MethodInfo[] publicMethods = extractPublicMethods(rootClient);
     int totalMethods = publicMethods.length();
 
     if !config.quietMode {
-        io:println(string `Found ${totalMethods} public methods`);
+        io:println(string `  → ${totalMethods} methods`);
     }
 
     // Step 8: Rank methods by usage using LLM
     if !config.quietMode {
-        io:println("Step 6/7: Ranking methods by usage with LLM...");
+        io:println("Step 6/7: Ranking methods...");
     }
 
     MethodInfo[]|AnalyzerError rankedResult = rankMethodsByUsageWithLLM(publicMethods);
@@ -251,20 +227,18 @@ public function analyzeJavaSDK(string jarPath, string outputDir, AnalyzerConfig 
 
     // Step 9: Generate structured metadata
     if !config.quietMode {
-        io:println("Step 7/7: Generating structured metadata...");
+        io:println("Step 7/7: Generating metadata...");
     }
 
+    // Pass the full set of extracted classes so enum types and other supporting
+    // classes can be resolved when generating structured metadata.
     StructuredSDKMetadata structuredMetadata = generateStructuredMetadata(
         rootClient,
         clientInitPattern,
         selectedMethods,
-        rawClasses  // Use all classes to find enums and request types
+        rawClasses,
+        config
     );
-
-    // Try to infer SDK version from the provided JAR path
-    string sdkVersion = extractSdkVersion(jarPath);
-    // Update the nested sdkInfo.version field (record is mutable here)
-    structuredMetadata.sdkInfo.version = sdkVersion;
 
     // Step 10: Create final metadata object
     time:Utc endTime = time:utcNow();
@@ -272,10 +246,6 @@ public function analyzeJavaSDK(string jarPath, string outputDir, AnalyzerConfig 
     int durationMs = <int>(duration * 1000);
 
     // Step 11: Write outputs
-    if !config.quietMode {
-        io:println();
-        io:println("Writing output files...");
-    }
 
     // Write structured metadata JSON with SDK simple name
     string sdkSimpleName = structuredMetadata.rootClient.simpleName.toLowerAscii();
@@ -283,12 +253,7 @@ public function analyzeJavaSDK(string jarPath, string outputDir, AnalyzerConfig 
     check writeStructuredMetadata(structuredMetadata, outputDir, sdkSimpleName);
 
     if !config.quietMode {
-        io:println(string `Structured metadata written to: ${metadataPath}`);
-    }
-
-    if !config.quietMode {
-        string reportPath = string `${outputDir}/analysis-report.txt`;
-        io:println(string `Analysis report written to: ${reportPath}`);
+        io:println(string `  → Output: ${metadataPath}`);
     }
 
     // Calculate final duration
@@ -296,7 +261,7 @@ public function analyzeJavaSDK(string jarPath, string outputDir, AnalyzerConfig 
     decimal finalDuration = time:utcDiffSeconds(finalEndTime, startTime);
 
     if !config.quietMode {
-        io:println(string `Analysis completed in ${finalDuration} seconds`);
+        io:println(string `Done in ${finalDuration}s`);
     }
 
     return {
@@ -329,6 +294,14 @@ function isRelevantClientClass(ClassInfo cls) returns boolean {
         return false;
     }
 
+    // Skip test classes
+    string[] testPatterns = ["Test", "test", "Mock", "mock", "Stub", "stub"];
+    foreach string pattern in testPatterns {
+        if cls.simpleName.includes(pattern) {
+            return false;
+        }
+    }
+
     // Include classes with many public methods
     int publicMethodCount = 0;
     foreach MethodInfo method in cls.methods {
@@ -340,17 +313,134 @@ function isRelevantClientClass(ClassInfo cls) returns boolean {
     return publicMethodCount > 5;
 }
 
+# Detect the client initialization pattern from constructors
+#
+# + clientClass - Root client ClassInfo
+# + return - Initialization pattern description
+function detectClientInitPattern(ClassInfo clientClass) returns string {
+    if clientClass.constructors.length() == 0 {
+        return "No public constructors found";
+    }
+
+    string[] patterns = [];
+    foreach ConstructorInfo constructor in clientClass.constructors {
+        if constructor.parameters.length() == 0 {
+            patterns.push("Default constructor");
+        } else {
+            string[] paramTypes = constructor.parameters.map(p => p.typeName);
+            patterns.push(string `Constructor(${string:'join(", ", ...paramTypes)})`);
+        }
+    }
+
+    return string:'join(" | ", ...patterns);
+}
+
+# Detect the client initialization pattern from constructors returning ClientInitPattern record
+#
+# + clientClass - Root client ClassInfo
+# + return - ClientInitPattern record
+function detectClientInitPatternRecord(ClassInfo clientClass) returns ClientInitPattern {
+    if clientClass.constructors.length() == 0 {
+        return {
+            patternName: "no-constructor",
+            initializationCode: "// No public constructors found",
+            explanation: "The class does not expose public constructors",
+            detectedBy: "heuristic"
+        };
+    }
+
+    string[] patterns = [];
+    string[] codePatterns = [];
+    foreach ConstructorInfo constructor in clientClass.constructors {
+        if constructor.parameters.length() == 0 {
+            patterns.push("Default constructor");
+            codePatterns.push(string `new ${clientClass.simpleName}()`);
+        } else {
+            string[] paramTypes = constructor.parameters.map(p => p.typeName);
+            patterns.push(string `Constructor(${string:'join(", ", ...paramTypes)})`);
+            string[] paramNames = constructor.parameters.map(p => p.name);
+            codePatterns.push(string `new ${clientClass.simpleName}(${string:'join(", ", ...paramNames)})`);
+        }
+    }
+
+    return {
+        patternName: "constructor",
+        initializationCode: string:'join(" // OR\n", ...codePatterns),
+        explanation: string:'join(" | ", ...patterns),
+        detectedBy: "heuristic"
+    };
+}
+
+# Build constructor signature
+#
+# + constructor - Constructor info
+# + return - Constructor signature string
+function buildConstructorSignature(ConstructorInfo constructor) returns string {
+    string[] paramStrings = constructor.parameters.map(p => string `${p.typeName} ${p.name}`);
+    return string `(${string:'join(", ", ...paramStrings)})`;
+}
+
+
+
+# Extract SDK version from JAR path
+#
+# + jarPath - Path to JAR file
+# + return - Extracted version string
+function extractSdkVersion(string jarPath) returns string {
+    string[] pathParts = regex:split(jarPath, "/");
+    string filename = pathParts[pathParts.length() - 1];
+    
+    // Remove .jar extension
+    if filename.endsWith(".jar") {
+        filename = filename.substring(0, filename.length() - 4);
+    }
+
+    // Look for version pattern (numbers with dots/dashes)
+    string[] parts = regex:split(filename, "-");
+    foreach string part in parts.reverse() {
+        if regex:matches(part, "^[0-9]+\\.[0-9]+.*") {
+            return part;
+        }
+    }
+    
+    return "unknown";
+}
+
+# Extract simple name from full class name
+#
+# + fullName - Full class name
+# + return - Simple class name
+function extractSimpleName(string fullName) returns string {
+    string[] parts = regex:split(fullName, "\\.");
+    return parts[parts.length() - 1];
+}
+
 # Wrapper function for JavaParser analysis
 #
 # + jarPath - Path to JAR file  
-# + config - Analyzer configuration (for sources path)
+# + config - Analyzer configuration (e.g., javadocPath) to pass to the Java interop layer
 # + return - Array of ClassInfo or error
 public function analyzeJarWithJavaParserWrapper(string jarPath, AnalyzerConfig config) returns ClassInfo[]|AnalyzerError {
     // Call into the jar parser which wraps the Java interop implementation.
     // This supports both local JAR paths and Maven coordinates.
-    ClassInfo[]|error res = parseJarFromReference(jarPath, config.sourcesPath);
+    // Pass config which may include javadocPath for filtered javadoc extraction.
+    ClassInfo[]|error res = parseJarFromReference(jarPath, config);
     if res is error {
         // Convert generic error to AnalyzerError alias
+        return <AnalyzerError> res;
+    }
+    return res;
+}
+
+# Wrapper function for JavaParser analysis that also returns dependency JAR paths.
+# This is useful for resolving external classes from dependency JARs.
+#
+# + jarPath - Path to JAR file  
+# + config - Analyzer configuration (e.g., javadocPath) to pass to the Java interop layer
+# + return - ParsedJarResult containing classes and dependency paths, or error
+public function analyzeJarWithDependencies(string jarPath, AnalyzerConfig config) returns ParsedJarResult|AnalyzerError {
+    ParsedJarResult|error res = parseJarWithDependencies(jarPath, config);
+    if res is error {
         return <AnalyzerError> res;
     }
     return res;
@@ -443,25 +533,40 @@ function prettyPrintJson(json v, int indent) returns string {
         if keys.length() == 0 {
             return "{}";
         }
-        string out = "{\n";
-        int writtenFields = 0;
-        foreach int i in 0 ..< keys.length() {
-            string k = keys[i];
+        
+        // Filter out keys with null values that should be omitted
+        string[] filteredKeys = [];
+        string[] omitIfNullKeys = ["enumReference", "memberReference"];
+        foreach string k in keys {
             json val = m[k];
-            
-            // Skip enumReference and description if they are null
-            if (k == "enumReference" || k == "description") && val is () {
-                continue;
+            boolean shouldOmit = false;
+            if val is () {
+                foreach string omitKey in omitIfNullKeys {
+                    if k == omitKey {
+                        shouldOmit = true;
+                        break;
+                    }
+                }
             }
-            
-            if writtenFields > 0 {
-                out += ",\n";
+            if !shouldOmit {
+                filteredKeys.push(k);
             }
-            out += indentString(indent + 1) + "\"" + k + "\": " + prettyPrintJson(val, indent + 1);
-            writtenFields += 1;
         }
-        if writtenFields > 0 {
-            out += "\n";
+        
+        if filteredKeys.length() == 0 {
+            return "{}";
+        }
+        
+        string out = "{\n";
+        foreach int i in 0 ..< filteredKeys.length() {
+            string k = filteredKeys[i];
+            json val = m[k];
+            out += indentString(indent + 1) + "\"" + k + "\": " + prettyPrintJson(val, indent + 1);
+            if i < filteredKeys.length() - 1 {
+                out += ",\n";
+            } else {
+                out += "\n";
+            }
         }
         out += indentString(indent) + "}";
         return out;
@@ -485,6 +590,8 @@ function prettyPrintJson(json v, int indent) returns string {
     return v.toString();
 }
 
+
+
 # Write the list of all extracted classes to a text file for offline inspection
 #
 # + outputDir - Output directory to write the class list file
@@ -507,7 +614,7 @@ function writeClassList(string outputDir, ClassInfo[] rawClasses) returns error?
     return;
 }
 
-# Write the list of filtered classes
+# Write the list of filtered classes (those considered for client identification)
 #
 # + outputDir - Output directory to write the class list file  
 # + filteredClasses - Array of ClassInfo representing filtered classes

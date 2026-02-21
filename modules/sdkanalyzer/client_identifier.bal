@@ -91,18 +91,30 @@ public function identifyClientClassWithLLM(ClassInfo[] classes, int maxCandidate
 # Detect class initialization pattern using LLM
 #
 # + rootClient - The identified root client class
+# + allClasses - All classes available in the JAR (for builder hierarchy resolution)
+# + dependencyJarPaths - Paths to dependency JARs for resolving external classes
 # + return - Detected initialization pattern
-public function detectClientInitPatternWithLLM(ClassInfo rootClient) returns ClientInitPattern|error {
+public function detectClientInitPatternWithLLM(ClassInfo rootClient, ClassInfo[] allClasses, string[] dependencyJarPaths) returns ClientInitPattern|error {
     if !isAnthropicConfigured() {
         return error("Anthropic LLM not configured: cannot detect init pattern using LLM");
     }
 
     // Use LLM to detect pattern and propagate any errors
-    ClientInitPattern|error pattern = detectInitPatternWithLLM(rootClient);
-    if pattern is ClientInitPattern {
-        return pattern;
+    ClientInitPattern|error patternResult = detectInitPatternWithLLM(rootClient, allClasses, dependencyJarPaths);
+    if patternResult is error {
+        return patternResult;
     }
-    return pattern; // propagate error
+    ClientInitPattern pattern = patternResult;
+
+    // Resolve builder connection fields after detection
+    if pattern.patternName == "builder" || pattern.patternName == "static-factory" ||
+       pattern.patternName == "constructor" {
+        [string?, ConnectionFieldInfo[]] builderResult = resolveBuilderConnectionFields(rootClient, allClasses, dependencyJarPaths);
+        pattern.builderClass = builderResult[0];
+        pattern.connectionFields = builderResult[1];
+    }
+
+    return pattern;
 }
 
 # Extract all public methods from root client class
@@ -220,7 +232,6 @@ public function extractParameterFieldTypes(MethodInfo[] methods, ClassInfo[] all
                     annotations: sel.annotations,
                     exceptions: sel.exceptions,
                     typeParameters: sel.typeParameters,
-                    javadoc: sel.javadoc,
                     signature: sel.signature
                 };
                 enhancedMethodsOrdered.push(enhancedMethod);
@@ -238,25 +249,113 @@ public function extractParameterFieldTypes(MethodInfo[] methods, ClassInfo[] all
 # + initPattern - The initialization pattern
 # + rankedMethods - Methods ranked by usage
 # + allClasses - All classes for context
+# + config - Analyzer configuration
 # + return - Complete structured metadata
 public function generateStructuredMetadata(
     ClassInfo rootClient, 
     ClientInitPattern initPattern,
     MethodInfo[] rankedMethods,
-    ClassInfo[] allClasses
+    ClassInfo[] allClasses,
+    AnalyzerConfig config
 ) returns StructuredSDKMetadata {
     
     // Track enums globally to avoid duplication
     map<EnumMetadata> enumCache = {};
     
-    // Populate request fields for all parameters in the selected methods
-    MethodInfo[] methodsWithRequestFields = [];
+    // Track member classes referenced in List/Map types
+    map<ClassInfo> memberClassCache = {};
+    
+    // Step 1: Collect all parameter instances (method::param) and their fields
+    map<RequestFieldInfo[]> paramInstanceFieldsMap = {};
+
     foreach MethodInfo method in rankedMethods {
+        foreach ParameterInfo param in method.parameters {
+            ClassInfo? requestClass = resolveRequestClassFromParameter(param, allClasses, method.name);
+            if requestClass is ClassInfo {
+                string instanceKey = string `${method.name}::${param.name}`;
+                // Extract fields for this parameter instance (no deduplication to respect per-parameter context)
+                RequestFieldInfo[] fields = extractRequestFields(requestClass);
+                paramInstanceFieldsMap[instanceKey] = fields;
+            }
+        }
+    }
+
+    // Step 2: Batch analyze all parameter instances with LLM
+    map<string[]> requiredFieldsMap = {};
+
+    if !config.disableLLM && paramInstanceFieldsMap.length() > 0 {
+        string batchPrompt = "";
+        foreach [string, RequestFieldInfo[]] [instanceKey, fields] in paramInstanceFieldsMap.entries() {
+            if batchPrompt.length() > 0 {
+                batchPrompt += "\n\n";
+            }
+            batchPrompt += string `${instanceKey}:\n`;
+            foreach RequestFieldInfo fld in fields {
+                batchPrompt += string `  - ${fld.name}\n`;
+            }
+        }
+
+        AnthropicConfiguration|error llmConfigResult = getAnthropicConfig();
+        if llmConfigResult is AnthropicConfiguration {
+            string sysPrompt = "You are an expert Java SDK analyzer. Based on your knowledge of SDK design patterns, " +
+                "identify which fields are REQUIRED for each parameter instance. " +
+                "Return ONLY valid JSON: {\"Method::ParamName\":[\"requiredField1\",\"requiredField2\"]}";
+
+            string userPrompt = string `Identify REQUIRED fields for these method parameters:\n\n${batchPrompt}\n\nReturn JSON: {"Method::ParamName":["field1","field2"]}`;
+
+            json|error llmResponse = callAnthropicAPI(llmConfigResult, sysPrompt, userPrompt);
+
+            if !(llmResponse is error) {
+                string responseText = extractResponseText(llmResponse);
+                string jsonText = responseText.trim();
+
+                // Extract JSON from markdown code blocks or find JSON object
+                int? jsonStartIdx = jsonText.indexOf("```json");
+                if jsonStartIdx is int {
+                    jsonText = jsonText.substring(jsonStartIdx + 7);
+                }
+                int? codeBlockIdx = jsonText.indexOf("```");
+                if codeBlockIdx is int {
+                    jsonText = jsonText.substring(0, codeBlockIdx);
+                }
+
+                // Find the first { and last }
+                int? firstBrace = jsonText.indexOf("{");
+                int? lastBrace = jsonText.lastIndexOf("}");
+                if firstBrace is int && lastBrace is int && lastBrace > firstBrace {
+                    jsonText = jsonText.substring(firstBrace, lastBrace + 1);
+                }
+
+                jsonText = jsonText.trim();
+
+                json|error parsedJson = jsonText.fromJsonString();
+                if parsedJson is map<json> {
+                    foreach [string, json] [instanceKey, fieldData] in parsedJson.entries() {
+                        if fieldData is json[] {
+                            string[] reqFields = [];
+                            foreach json item in fieldData {
+                                if item is string {
+                                    reqFields.push(item);
+                                }
+                            }
+                            requiredFieldsMap[instanceKey] = reqFields;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Step 3: Populate request fields using cached results
+    MethodInfo[] methodsWithRequestFields = [];
+    foreach int methodIdx in 0 ..< rankedMethods.length() {
+        MethodInfo method = rankedMethods[methodIdx];
         MethodInfo updatedMethod = method;
         
         // Update each parameter with request fields if it's a request object
         ParameterInfo[] updatedParams = [];
-        foreach ParameterInfo param in method.parameters {
+        foreach int paramIdx in 0 ..< method.parameters.length() {
+            ParameterInfo param = method.parameters[paramIdx];
             ParameterInfo updatedParam = param;
 
             // Try to resolve the request class via generics, builders, or method-name heuristics
@@ -265,11 +364,43 @@ public function generateStructuredMetadata(
                 // Replace the parameter's exposed type with the resolved Request class
                 updatedParam.typeName = requestClass.className;
                 
-                // Extract request fields and check for enums
+                // Extract request fields
                 RequestFieldInfo[] fields = extractRequestFields(requestClass);
+                string paramKey = string `${method.name}::${param.name}`;
+                
+                // Apply cached LLM results
+                string[] requiredFields = [];
+                if requiredFieldsMap.hasKey(paramKey) {
+                    string[]? reqFieldsVal = requiredFieldsMap.get(paramKey);
+                    if reqFieldsVal is string[] {
+                        requiredFields = reqFieldsVal;
+                    }
+                }
+                
+                RequestFieldInfo[] updatedFields = [];
+                foreach RequestFieldInfo fld in fields {
+                    RequestFieldInfo updated = fld;
+                    // Check if this field is in the required list
+                    boolean isReq = false;
+                    foreach string reqField in requiredFields {
+                        if fld.name == reqField {
+                            isReq = true;
+                            break;
+                        }
+                    }
+                    updated.isRequired = isReq;
+                    updatedFields.push(updated);
+                }
+                fields = updatedFields;
+                
                 RequestFieldInfo[] enhancedFields = [];
                 
                 foreach RequestFieldInfo fieldInfo in fields {
+                    // Filter redundant AsString fields (e.g., aclAsString when acl exists)
+                    if isRedundantAsStringField(fieldInfo.name, fields) {
+                        continue;
+                    }
+                    
                     RequestFieldInfo enhancedField = fieldInfo;
                     
                     // Check if field type is an enum and extract enum values
@@ -283,6 +414,22 @@ public function generateStructuredMetadata(
                         }
                         // Set enum reference
                         enhancedField.enumReference = fieldInfo.fullType;
+                    }
+                    
+                    // Check if field type is a collection (List, Set, Map, etc.) and extract memberReference
+                    if isCollectionType(fieldInfo.typeName) {
+                        string? genericParam = extractGenericTypeParameter(fieldInfo.fullType);
+                        if genericParam is string && genericParam.length() > 0 {
+                            // Verify the generic parameter class exists
+                            ClassInfo? memberClass = findClassByName(genericParam, allClasses);
+                            if memberClass is ClassInfo {
+                                enhancedField.memberReference = genericParam;
+                                // Cache the member class for extraction
+                                if !memberClassCache.hasKey(genericParam) {
+                                    memberClassCache[genericParam] = memberClass;
+                                }
+                            }
+                        }
                     }
                     
                     enhancedFields.push(enhancedField);
@@ -304,8 +451,61 @@ public function generateStructuredMetadata(
         }
         
         updatedMethod.parameters = updatedParams;
+
+        // Populate returnFields for methods whose return type is a non-simple class
+        RequestFieldInfo[] returnFields = [];
+        if updatedMethod.returnType != "void" && !isSimpleType(updatedMethod.returnType) {
+            ClassInfo? retCls = findClassByName(updatedMethod.returnType, allClasses);
+            if retCls is ClassInfo {
+                RequestFieldInfo[] rawReturnFields = extractResponseFields(retCls);
+
+                // For any enum fields in the response, cache enum metadata and set enumReference
+                // Also set memberReference for collection types
+                RequestFieldInfo[] enhancedReturnFields = [];
+                foreach RequestFieldInfo rf in rawReturnFields {
+                    // Filter redundant AsString fields
+                    if isRedundantAsStringField(rf.name, rawReturnFields) {
+                        continue;
+                    }
+                    
+                    RequestFieldInfo enhancedRf = rf;
+                    ClassInfo? enumClass = findClassByName(rf.fullType, allClasses);
+                    if enumClass is ClassInfo && enumClass.isEnum {
+                        if !enumCache.hasKey(rf.fullType) {
+                            EnumMetadata enumMeta = extractEnumMetadata(enumClass);
+                            enumCache[rf.fullType] = enumMeta;
+                        }
+                        enhancedRf.enumReference = rf.fullType;
+                    }
+                    
+                    // Check if field type is a collection (List, Set, Map, etc.) and extract memberReference
+                    if isCollectionType(rf.typeName) {
+                        string? genericParam = extractGenericTypeParameter(rf.fullType);
+                        if genericParam is string && genericParam.length() > 0 {
+                            // Verify the generic parameter class exists
+                            ClassInfo? memberClass = findClassByName(genericParam, allClasses);
+                            if memberClass is ClassInfo {
+                                enhancedRf.memberReference = genericParam;
+                                // Cache the member class for extraction
+                                if !memberClassCache.hasKey(genericParam) {
+                                    memberClassCache[genericParam] = memberClass;
+                                }
+                            }
+                        }
+                    }
+                    
+                    enhancedReturnFields.push(enhancedRf);
+                }
+                returnFields = enhancedReturnFields;
+            }
+        }
+
+        updatedMethod.returnFields = returnFields;
         methodsWithRequestFields.push(updatedMethod);
     }
+    
+    // Extract member class information from cached member classes
+    map<MemberClassInfo> memberClasses = extractMemberClassInfo(memberClassCache);
     
     return {
         sdkInfo: {
@@ -323,6 +523,7 @@ public function generateStructuredMetadata(
             methods: methodsWithRequestFields
         },
         supportingClasses: extractSupportingClasses(rankedMethods, allClasses),
+        memberClasses: memberClasses,
         enums: enumCache,
         analysis: {
             totalClassesFound: allClasses.length(),
@@ -466,7 +667,7 @@ function isAnthropicConfigured() returns boolean {
     return false;
 }
 
-function detectInitPatternWithLLM(ClassInfo rootClient) returns ClientInitPattern|error {
+function detectInitPatternWithLLM(ClassInfo rootClient, ClassInfo[] allClasses, string[] dependencyJarPaths) returns ClientInitPattern|error {
     // Use LLM for comprehensive pattern analysis if available
     if isAnthropicConfigured() {
         string systemPrompt = getInitPatternSystemPrompt();
@@ -511,6 +712,12 @@ function detectInitPatternWithLLM(ClassInfo rootClient) returns ClientInitPatter
                     explanation: reason == "" ? "Pattern detected by LLM analysis" : reason,
                     detectedBy: "llm"
                 };
+                if patternName == "builder" || patternName == "static-factory" ||
+                   patternName == "constructor" {
+                    [string?, ConnectionFieldInfo[]] br = resolveBuilderConnectionFields(rootClient, allClasses, dependencyJarPaths);
+                    llmPattern.builderClass = br[0];
+                    llmPattern.connectionFields = br[1];
+                }
                 return llmPattern;
             }
         } else {
@@ -521,6 +728,12 @@ function detectInitPatternWithLLM(ClassInfo rootClient) returns ClientInitPatter
     
     // Fallback to heuristic pattern if LLM unavailable or fails
     ClientInitPattern heuristicPattern = detectClientInitPatternHeuristically(rootClient);
+    if heuristicPattern.patternName == "builder" || heuristicPattern.patternName == "static-factory" ||
+       heuristicPattern.patternName == "constructor" {
+        [string?, ConnectionFieldInfo[]] br = resolveBuilderConnectionFields(rootClient, allClasses, dependencyJarPaths);
+        heuristicPattern.builderClass = br[0];
+        heuristicPattern.connectionFields = br[1];
+    }
     return heuristicPattern;
 }
 
@@ -564,12 +777,172 @@ function rankMethodsUsingLLM(MethodInfo[] methods) returns MethodInfo[]|error {
                     }
                 }
             }
-
-            return reordered;
+            
+            // Now fetch descriptions for the selected methods
+            MethodInfo[] withDescriptions = check addMethodDescriptions(reordered);
+            return withDescriptions;
         }
     }
 
     return error("Failed to rank methods using LLM");
+}
+
+# Fetch descriptions for selected methods from LLM (only for methods without descriptions)
+#
+# + methods - Selected methods to get descriptions for
+# + return - Methods with descriptions added
+function addMethodDescriptions(MethodInfo[] methods) returns MethodInfo[]|error {
+    if methods.length() == 0 {
+        return methods;
+    }
+    
+    // Identify methods that need descriptions (don't have javadoc descriptions)
+    MethodInfo[] needsDescription = [];
+    int[] needsDescriptionIndices = [];
+    foreach int i in 0 ..< methods.length() {
+        if methods[i].description is () || methods[i].description == "" {
+            needsDescription.push(methods[i]);
+            needsDescriptionIndices.push(i);
+        }
+    }
+    
+    // If all methods have descriptions, return as-is
+    if needsDescription.length() == 0 {
+        return methods;
+    }
+    
+    // If LLM not configured, return methods as-is
+    if !isAnthropicConfigured() {
+        return methods;
+    }
+    
+    // Build method list with signatures for methods needing descriptions
+    string methodList = "";
+    foreach int i in 0 ..< needsDescription.length() {
+        MethodInfo m = needsDescription[i];
+        string paramTypes = "";
+        if m.parameters.length() > 0 {
+            string[] pTypes = [];
+            foreach ParameterInfo p in m.parameters {
+                pTypes.push(p.typeName);
+            }
+            paramTypes = string:'join(", ", ...pTypes);
+        }
+        methodList = methodList + (i + 1).toString() + ". " + m.name + "(" + paramTypes + ") -> " + m.returnType + "\n";
+    }
+    
+    string systemPrompt = "You are a Java SDK expert. Provide one-line descriptions for the given methods. " +
+        "Each description should clearly explain what the method does in user-friendly language. " +
+        "Return ONLY the descriptions, one per line, in the same order as the input methods. " +
+        "Do not include method names or numbers, just pure descriptions.";
+    
+    string userPrompt = "Provide one-line descriptions for these methods:\n\n" + methodList + 
+        "\nDescriptions (one per line, in same order):";
+    
+    json|error response = callAnthropicAPI(check getAnthropicConfig(), systemPrompt, userPrompt);
+    
+    if response is json {
+        string responseText = extractResponseText(response).trim();
+        if responseText != "" {
+            string[] descriptions = regex:split(responseText, "\n");
+            descriptions = descriptions.map(d => d.trim()).filter(d => d.length() > 0);
+            
+            // Apply LLM descriptions only to methods that needed them
+            MethodInfo[] result = methods.clone();
+            foreach int i in 0 ..< needsDescriptionIndices.length() {
+                if i < descriptions.length() {
+                    int methodIndex = needsDescriptionIndices[i];
+                    result[methodIndex].description = descriptions[i];
+                }
+            }
+            return result;
+        }
+    }
+    
+    // Return methods without descriptions if LLM call fails
+    return methods;
+}
+
+# Ask LLM to select the top-N most-used methods from the provided list.
+#
+# + methods - All methods 
+# + n - Number of methods to select
+# + return - Selected top-N methods or error
+function selectTopNMethodsWithLLM(MethodInfo[] methods, int n) returns MethodInfo[]|error {
+    if n <= 0 {
+        return error("Invalid n passed to selectTopNMethodsWithLLM");
+    }
+
+    if methods.length() == 0 {
+        return methods;
+    }
+
+    if !isAnthropicConfigured() {
+        return error("Anthropic LLM not configured: cannot select top-N methods");
+    }
+
+    string systemPrompt = getMethodRankingSystemPrompt();
+    string methodsList = formatMethodsListForRanking(methods);
+    string userPrompt = getMethodSelectionUserPrompt(methods.length(), methodsList, n);
+
+    json|error response = callAnthropicAPI(check getAnthropicConfig(), systemPrompt, userPrompt);
+    if response is json {
+        string responseText = extractResponseText(response).trim();
+        if responseText == "" {
+            responseText = response.toString();
+        }
+
+        // Parse comma-separated method names
+        string[] parts = regex:split(responseText, ",");
+        string[] trimmed = parts.map(p => p.trim()).filter(p => p.length() > 0);
+
+        if trimmed.length() == 0 {
+            return error("LLM returned no method names for top-N selection");
+        }
+
+        // Map names to MethodInfo by exact match on name
+        map<MethodInfo> methodMap = {};
+        foreach MethodInfo m in methods {
+            methodMap[m.name] = m;
+        }
+
+        MethodInfo[] selected = [];
+        foreach string name in trimmed {
+            if methodMap.hasKey(name) {
+                MethodInfo? mm = methodMap[name];
+                if mm is MethodInfo {
+                    selected.push(mm);
+                }
+            }
+            if selected.length() == n {
+                break;
+            }
+        }
+
+        // If LLM returned fewer valid names than n, fall back to filling from original list
+        if selected.length() < n {
+            foreach MethodInfo m in methods {
+                // avoid duplicates
+                boolean found = false;
+                foreach MethodInfo s in selected {
+                    if s.name == m.name {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    selected.push(m);
+                }
+                if selected.length() == n {
+                    break;
+                }
+            }
+        }
+
+        return selected;
+    }
+
+    return error("Failed to call LLM for top-N method selection");
 }
 
 # Heuristic-based client initialization pattern detection
@@ -633,70 +1006,440 @@ function detectClientInitPatternHeuristically(ClassInfo clientClass) returns Cli
         detectedBy: "heuristic"
     };
 }
-# Enrich metadata with LLM-generated descriptions for methods, parameters, and fields
+
+# Analyze fields using LLM to determine if they are required or optional
 #
-# + metadata - Base metadata structure
-# + sdkName - SDK name for context
-# + sdkVersion - SDK version
+# + methodName - Method name for context
+# + parameterType - Parameter type name
+# + fields - Array of request fields to analyze
 # + config - Analyzer configuration
-# + return - Enriched metadata with descriptions
-public function enrichMetadataWithDescriptions(
-    StructuredSDKMetadata metadata,
-    string sdkName,
-    string sdkVersion,
+# + return - Updated fields with isRequired set by LLM
+public function analyzeFieldRequirements(
+    string methodName,
+    string parameterType,
+    RequestFieldInfo[] fields,
     AnalyzerConfig config
-) returns StructuredSDKMetadata|error {
+) returns RequestFieldInfo[]|error {
     
-    if config.disableLLM {
-        return metadata;
+    if config.disableLLM || fields.length() == 0 {
+        return fields;
     }
     
-    StructuredSDKMetadata enrichedMetadata = metadata;
-    MethodInfo[] enrichedMethods = [];
+    // Build field list for prompt
+    string fieldsList = "";
+    foreach RequestFieldInfo fld in fields {
+        fieldsList += string `- ${fld.name}: ${fld.typeName}\n`;
+    }
     
-    // Enrich each method with descriptions
-    foreach MethodInfo method in metadata.rootClient.methods {
-        MethodInfo enrichedMethod = method;
+    // Get LLM config
+    AnthropicConfiguration llmConfig = check getAnthropicConfig();
+    
+    // Call LLM
+    string sysPrompt = getFieldRequirementSystemPrompt();
+    string userPrompt = getFieldRequirementUserPrompt(methodName, parameterType, fieldsList);
+    json|error llmResponse = callAnthropicAPI(llmConfig, sysPrompt, userPrompt);
+    
+    if llmResponse is error {
+        // If LLM fails, return original fields
+        return fields;
+    }
+    
+    // Parse LLM response
+    string responseText = extractResponseText(llmResponse);
+    
+    // Extract JSON array from response (handle markdown code blocks)
+    string jsonText = responseText.trim();
+    if jsonText.startsWith("```json") {
+        jsonText = jsonText.substring(7);
+    }
+    if jsonText.startsWith("```") {
+        jsonText = jsonText.substring(3);
+    }
+    if jsonText.endsWith("```") {
+        jsonText = jsonText.substring(0, jsonText.length() - 3);
+    }
+    jsonText = jsonText.trim();
+    
+    json|error parsedJson = jsonText.fromJsonString();
+    if parsedJson is error {
+        // If parsing fails, return original fields
+        return fields;
+    }
+    
+    // Parse the JSON array and update fields
+    if parsedJson is json[] {
+        map<boolean> requirementMap = {};
         
-        // Enrich parameters
-        ParameterInfo[] enrichedParams = [];
-        foreach ParameterInfo param in enrichedMethod.parameters {
-            ParameterInfo enrichedParam = param;
-            
-            // If parameter has request fields, enrich them
-            RequestFieldInfo[]? fields = param.requestFields;
-            if fields is RequestFieldInfo[] && fields.length() > 0 {
-                RequestFieldInfo[] enrichedFields = [];
+        foreach json item in parsedJson {
+            if item is map<json> {
+                string? fieldName = <string?> item["field"];
+                boolean? required = <boolean?> item["required"];
                 
-                // For now, skip LLM enrichment due to complexity - keep original fields
-                // TODO: Implement full LLM enrichment with proper JSON parsing
-                enrichedFields = fields;
-                
-                enrichedParam.requestFields = enrichedFields;
+                if fieldName is string && required is boolean {
+                    requirementMap[fieldName] = required;
+                }
             }
-            
-            enrichedParams.push(enrichedParam);
         }
         
-        enrichedMethod.parameters = enrichedParams;
-        enrichedMethods.push(enrichedMethod);
+        // Update fields with LLM results
+        RequestFieldInfo[] updatedFields = [];
+        foreach RequestFieldInfo fld in fields {
+            RequestFieldInfo updated = fld;
+            if requirementMap.hasKey(fld.name) {
+                updated.isRequired = requirementMap.get(fld.name);
+            }
+            updatedFields.push(updated);
+        }
+        
+        return updatedFields;
     }
     
-    // Update metadata with enriched methods
-    enrichedMetadata.rootClient.methods = enrichedMethods;
-    
-    return enrichedMetadata;
+    return fields;
 }
 
-# Format parameter fields for LLM prompt
+# Check if a field is a redundant "AsString" variant of another field
+# For example, "aclAsString" is redundant when "acl" exists with an enum type
 #
-# + param - Parameter information
-# + fields - Request fields array
-# + return - Formatted parameter fields
-function formatParameterFieldsForLLM(ParameterInfo param, RequestFieldInfo[] fields) returns string {
-    string result = string `Parameter: ${param.name} (${param.typeName})\nFields:\n`;
-    foreach RequestFieldInfo fieldInfo in fields {
-        result += string `  - ${fieldInfo.name}: ${fieldInfo.typeName}\n`;
+# + fieldName - Field name to check
+# + allFields - All fields in the same context
+# + return - True if this field should be filtered out
+function isRedundantAsStringField(string fieldName, RequestFieldInfo[] allFields) returns boolean {
+    // Check if field name ends with "AsString" or "AsStrings"
+    if !fieldName.endsWith("AsString") && !fieldName.endsWith("AsStrings") {
+        return false;
     }
+    
+    // Extract the base field name (remove AsString/AsStrings suffix)
+    string baseFieldName;
+    if fieldName.endsWith("AsStrings") {
+        baseFieldName = fieldName.substring(0, fieldName.length() - 9);
+    } else {
+        baseFieldName = fieldName.substring(0, fieldName.length() - 8);
+    }
+    
+    // Check if the base field exists
+    foreach RequestFieldInfo fld in allFields {
+        if fld.name == baseFieldName {
+            // Base field exists, this AsString variant is redundant
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+# Extract member class information from cached member classes
+#
+# + memberClassCache - Map of class names to ClassInfo
+# + return - Map of member class info with extracted fields
+function extractMemberClassInfo(map<ClassInfo> memberClassCache) returns map<MemberClassInfo> {
+    map<MemberClassInfo> result = {};
+    
+    foreach [string, ClassInfo] [className, classInfo] in memberClassCache.entries() {
+        RequestFieldInfo[] extractedFields;
+        
+        // For enums, extract the actual enum constants from the fields array
+        if classInfo.isEnum {
+            extractedFields = extractEnumConstants(classInfo);
+        } else {
+            // For regular classes, extract fields from getter methods
+            extractedFields = extractResponseFields(classInfo);
+        }
+        
+        // Filter redundant AsString fields from member class fields too
+        RequestFieldInfo[] filteredFields = [];
+        foreach RequestFieldInfo fld in extractedFields {
+            if !isRedundantAsStringField(fld.name, extractedFields) {
+                filteredFields.push(fld);
+            }
+        }
+        
+        MemberClassInfo memberInfo = {
+            className: classInfo.className,
+            simpleName: classInfo.simpleName,
+            packageName: classInfo.packageName,
+            fields: filteredFields
+        };
+        
+        result[className] = memberInfo;
+    }
+    
     return result;
 }
+
+# Resolve connection/configuration fields by walking the builder class hierarchy.
+# Finds the builder class for a client (via the static builder() method or name convention),
+# then recursively follows superClass and interfaces to collect all setter-style configuration
+# methods (single parameter, returns builder/self or void).
+#
+# + clientClass - The root client ClassInfo
+# + allClasses  - All classes available (for hierarchy lookup)
+# + dependencyJarPaths - Paths to dependency JARs for resolving external classes
+# + return - Tuple of [builderClassName?, ConnectionFieldInfo[]]
+function resolveBuilderConnectionFields(ClassInfo clientClass, ClassInfo[] allClasses, string[] dependencyJarPaths)
+        returns [string?, ConnectionFieldInfo[]] {
+
+    // Step 1: find the builder class (may need to resolve from dependencies)
+    ClassInfo? builderClass = findBuilderClass(clientClass, allClasses, dependencyJarPaths);
+    if builderClass is () {
+        return [(), []];
+    }
+
+    // Step 2: walk hierarchy collecting setter methods
+    ConnectionFieldInfo[] fields = [];
+    map<boolean> visitedClasses = {};
+    map<boolean> visitedFieldNames = {};
+    // Use a mutable list to accumulate resolved classes from dependencies
+    ClassInfo[] resolvedClasses = [...allClasses];
+    collectBuilderSetters(builderClass, resolvedClasses, dependencyJarPaths, fields, visitedClasses, visitedFieldNames, 0);
+
+    return [builderClass.className, fields];
+}
+
+# Find the builder class for a client class.
+# Strategy:
+# 1. Look for a static method named "builder" and use its return type.
+# 2. Fall back to searching for a class whose simpleName ends with "Builder" and
+# whose name relates to the client's simple name.
+#
+# + clientClass - The client ClassInfo to find a builder for 
+# + allClasses - All classes available (for hierarchy lookup)
+# + dependencyJarPaths - Paths to dependency JARs for resolving external classes
+# + return - The builder ClassInfo if found, otherwise ()
+function findBuilderClass(ClassInfo clientClass, ClassInfo[] allClasses, string[] dependencyJarPaths) returns ClassInfo? {
+    // Strategy 1: static builder() method return type
+    foreach MethodInfo m in clientClass.methods {
+        if m.isStatic && m.name == "builder" && m.returnType != "void" {
+            ClassInfo? found = findClassByName(m.returnType, allClasses);
+            if found is ClassInfo {
+                return found;
+            }
+            // returnType may be a simple name — try with client package prefix
+            string qualified = clientClass.packageName + "." + m.returnType;
+            found = findClassByName(qualified, allClasses);
+            if found is ClassInfo {
+                return found;
+            }
+            // Try to resolve from dependency JARs
+            found = resolveClassFromJars(m.returnType, dependencyJarPaths);
+            if found is ClassInfo {
+                return found;
+            }
+            found = resolveClassFromJars(qualified, dependencyJarPaths);
+            if found is ClassInfo {
+                return found;
+            }
+        }
+    }
+
+    // Strategy 2: name-convention search — "<ClientSimpleName>Builder" or "<ClientSimpleName>$Builder"
+    string clientSimple = clientClass.simpleName;
+    foreach ClassInfo cls in allClasses {
+        string sn = cls.simpleName;
+        if (sn == clientSimple + "Builder" || sn == clientSimple + "$Builder") &&
+           cls.packageName == clientClass.packageName {
+            return cls;
+        }
+    }
+
+    // Strategy 3: any Builder in same package whose name contains the client name
+    foreach ClassInfo cls in allClasses {
+        if cls.simpleName.endsWith("Builder") &&
+           cls.packageName == clientClass.packageName &&
+           cls.simpleName.includes(clientSimple) {
+            return cls;
+        }
+    }
+
+    return ();
+}
+
+# Recursively collect setter-style methods from a builder class and its ancestors.
+# A setter method is one that:
+# - Has exactly ONE parameter
+# - Is not static
+# - Name is not a utility method (build, toString, hashCode, equals, …)
+# visitedClasses prevents infinite loops in diamond / circular hierarchies.
+#
+# + builderClass - The current builder ClassInfo to analyze  
+# + resolvedClasses - Mutable array of all resolved classes (may be extended with lazily resolved deps)
+# + dependencyJarPaths - Paths to dependency JARs for resolving external classes
+# + fields - The collected ConnectionFieldInfo array
+# + visitedClasses - Map of visited class names to prevent infinite loops
+# + visitedFieldNames - Map of visited field names to prevent duplicates
+# + depth - The current recursion depth
+function collectBuilderSetters(
+        ClassInfo builderClass,
+        ClassInfo[] resolvedClasses,
+        string[] dependencyJarPaths,
+        ConnectionFieldInfo[] fields,
+        map<boolean> visitedClasses,
+        map<boolean> visitedFieldNames,
+        int depth
+) {
+    int maxDepth = 10;
+    if depth > maxDepth {
+        return;
+    }
+    if visitedClasses.hasKey(builderClass.className) {
+        return;
+    }
+    visitedClasses[builderClass.className] = true;
+
+    // Collect fields from this class (not methods)
+    // These are the actual configuration fields stored in the builder
+    foreach FieldInfo f in builderClass.fields {
+        // Skip static fields and fields from interface definitions
+        if f.isStatic {
+            continue;
+        }
+        
+        string fieldName = f.name;
+        
+        // Skip internal/synthetic fields
+        if fieldName.startsWith("$") || fieldName.startsWith("_") {
+            continue;
+        }
+        
+        // Apply SDK-internal field filter
+        if shouldFilterField(fieldName, f.typeName) {
+            continue;
+        }
+        
+        // Skip builder pattern fields and special fields
+        string nameLower = fieldName.toLowerAscii();
+        if nameLower == "result" || nameLower == "builder" || nameLower == "parent" ||
+           nameLower == "config" || fieldName.endsWith("Builder") || fieldName.endsWith("Impl") {
+            continue;
+        }
+        
+        // Skip if already added
+        if visitedFieldNames.hasKey(fieldName) {
+            continue;
+        }
+        visitedFieldNames[fieldName] = true;
+
+        string simpleType = extractSimpleTypeName(f.typeName);
+
+        ConnectionFieldInfo info = {
+            name: fieldName,
+            typeName: simpleType,
+            fullType: f.typeName,
+            isRequired: false
+        };
+        if f.javadoc != () {
+            info.description = f.javadoc;
+        }
+        fields.push(info);
+        
+        // Try to resolve the field type class to extract its details
+        // This helps document complex field types
+        if !isPrimitiveType(f.typeName) {
+            ClassInfo? fieldTypeClass = findOrResolveClass(f.typeName, resolvedClasses, dependencyJarPaths);
+            if fieldTypeClass is ClassInfo {
+                // We've resolved it but don't add it as a field - just ensure it's in resolvedClasses
+            }
+        }
+    }
+
+    // Recurse into superClass
+    string? superClass = builderClass.superClass;
+    if superClass is string && superClass != "java.lang.Object" && superClass != "" {
+        ClassInfo? superInfo = findOrResolveClass(superClass, resolvedClasses, dependencyJarPaths);
+        if superInfo is ClassInfo {
+            collectBuilderSetters(superInfo, resolvedClasses, dependencyJarPaths, fields, visitedClasses, visitedFieldNames, depth + 1);
+        }
+    }
+
+    // Recurse into implemented interfaces (they may be generic Builder interfaces with default methods)
+    foreach string iface in builderClass.interfaces {
+        // Strip generic type parameters for lookup: e.g. "SdkClientBuilder<B,C>" -> "SdkClientBuilder"
+        string ifaceName = iface;
+        int? angleIdx = iface.indexOf("<");
+        if angleIdx is int && angleIdx > 0 {
+            ifaceName = iface.substring(0, angleIdx);
+        }
+        if ifaceName == "java.lang.Object" || ifaceName == "" {
+            continue;
+        }
+        ClassInfo? ifaceInfo = findOrResolveClass(ifaceName, resolvedClasses, dependencyJarPaths);
+        if ifaceInfo is ClassInfo {
+            collectBuilderSetters(ifaceInfo, resolvedClasses, dependencyJarPaths, fields, visitedClasses, visitedFieldNames, depth + 1);
+        }
+    }
+}
+
+# Check if a type name is a primitive or standard Java type
+#
+# + typeName - Type name to check
+# + return - True if primitive or standard type, false otherwise
+function isPrimitiveType(string typeName) returns boolean {
+    string lower = typeName.toLowerAscii();
+    return lower == "int" || lower == "long" || lower == "float" || lower == "double" ||
+           lower == "boolean" || lower == "byte" || lower == "char" || lower == "short" ||
+           lower == "string" || lower == "java.lang.string" || lower == "java.lang.object" ||
+           lower == "void" || lower == "java.lang.integer" || lower == "java.lang.long" ||
+           lower == "java.lang.boolean" || lower == "java.lang.double";
+}
+
+# Find a class by name in the resolved classes, or lazily resolve from dependency JARs.
+# If resolved from dependencies, the class is added to the resolvedClasses array for future lookups.
+#
+# + className - The class name to find
+# + resolvedClasses - Mutable array of all resolved classes
+# + dependencyJarPaths - Paths to dependency JARs for resolving external classes
+# + return - The ClassInfo if found, otherwise ()
+function findOrResolveClass(string className, ClassInfo[] resolvedClasses, string[] dependencyJarPaths) returns ClassInfo? {
+    // First try to find in already-resolved classes
+    ClassInfo? found = findClassByName(className, resolvedClasses);
+    if found is ClassInfo {
+        return found;
+    }
+    
+    // Try to resolve from dependency JARs
+    if dependencyJarPaths.length() > 0 {
+        ClassInfo? resolved = resolveClassFromJars(className, dependencyJarPaths);
+        if resolved is ClassInfo {
+            // Add to resolved classes for future lookups
+            resolvedClasses.push(resolved);
+            return resolved;
+        }
+    }
+    
+    return ();
+}
+
+# Extract enum constants from an enum class
+#
+# + enumClass - The enum ClassInfo
+# + return - List of enum constants as RequestFieldInfo
+function extractEnumConstants(ClassInfo enumClass) returns RequestFieldInfo[] {
+    RequestFieldInfo[] constants = [];
+    
+    foreach FieldInfo fld in enumClass.fields {
+        // Enum constants are static final fields of the enum type itself
+        if fld.isStatic && fld.isFinal {
+            // Skip internal fields like $VALUES, UNKNOWN_TO_SDK_VERSION, etc.
+            if fld.name.startsWith("$") || fld.name == "UNKNOWN_TO_SDK_VERSION" {
+                continue;
+            }
+            
+            RequestFieldInfo constInfo = {
+                name: fld.name,
+                typeName: enumClass.simpleName,
+                fullType: enumClass.className,
+                isRequired: false
+            };
+            
+            // Add javadoc description if available
+            if fld.javadoc != () {
+                constInfo.description = fld.javadoc;
+            }
+            
+            constants.push(constInfo);
+        }
+    }
+    
+    return constants;
+}
+

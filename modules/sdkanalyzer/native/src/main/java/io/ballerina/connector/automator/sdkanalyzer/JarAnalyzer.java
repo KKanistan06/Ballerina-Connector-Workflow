@@ -35,6 +35,7 @@ import java.lang.reflect.Modifier;
 import java.lang.reflect.Parameter;
 import java.lang.reflect.Type;
 import java.lang.reflect.TypeVariable;
+import java.util.Map;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.Path;
@@ -52,6 +53,9 @@ import java.util.jar.JarFile;
  * Extracts class metadata including methods, fields, constructors, and javadoc.
  */
 public class JarAnalyzer {
+
+    // Optional javadoc index: classFQN -> (memberName -> description)
+    private static Map<String, Map<String, String>> javadocIndex = null;
 
     /**
      * Parse JAR file and extract all class information.
@@ -142,6 +146,22 @@ public class JarAnalyzer {
                     urls.toArray(new URL[0]),
                     JarAnalyzer.class.getClassLoader());
                  JarFile jar = new JarFile(mainJar)) {
+
+                // Attempt to find a javadoc JAR in the same directory as the main JAR
+                try {
+                    File parent = mainJar.getParentFile();
+                    if (parent != null && parent.exists()) {
+                        File[] candidates = parent.listFiles((dir, name) -> name.toLowerCase().contains("javadoc") && name.endsWith(".jar"));
+                        if (candidates != null && candidates.length > 0) {
+                            // Choose first candidate
+                            File javadocJar = candidates[0];
+                            System.err.println("INFO: Found javadoc jar: " + javadocJar.getName());
+                            javadocIndex = JavadocExtractor.loadFromJar(javadocJar);
+                            System.err.println("INFO: Loaded javadoc entries for " + javadocIndex.size() + " classes");
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
 
                 Enumeration<JarEntry> entries = jar.entries();
 
@@ -390,14 +410,31 @@ public class JarAnalyzer {
         BMap<BString, Object> methodInfo = ValueCreator.createMapValue(mapType);
 
         methodInfo.put(StringUtils.fromString("name"), StringUtils.fromString(method.getName()));
+        // Use getGenericReturnType to preserve generic type parameters (e.g., List<Tag> instead of just List)
+        Type genericReturnType = method.getGenericReturnType();
         methodInfo.put(StringUtils.fromString("returnType"),
-                StringUtils.fromString(method.getReturnType().getName()));
+                StringUtils.fromString(genericReturnType.getTypeName()));
         methodInfo.put(StringUtils.fromString("isStatic"), Modifier.isStatic(method.getModifiers()));
         methodInfo.put(StringUtils.fromString("isFinal"), Modifier.isFinal(method.getModifiers()));
         methodInfo.put(StringUtils.fromString("isAbstract"), Modifier.isAbstract(method.getModifiers()));
         methodInfo.put(StringUtils.fromString("isDeprecated"),
                 method.isAnnotationPresent(Deprecated.class));
-        methodInfo.put(StringUtils.fromString("javadoc"), null);
+        // Attach javadoc summary if available
+        String methodJavadoc = null;
+        try {
+            if (javadocIndex != null) {
+                Map<String, String> classMap = javadocIndex.get(method.getDeclaringClass().getName());
+                if (classMap == null) {
+                    // try simple dot form (some javadocs use dot names already)
+                    classMap = javadocIndex.get(method.getDeclaringClass().getName().replace('$', '.'));
+                }
+                if (classMap != null) {
+                    String desc = classMap.get(method.getName());
+                    if (desc != null) methodJavadoc = desc;
+                }
+            }
+        } catch (Exception ignored) {}
+        methodInfo.put(StringUtils.fromString("javadoc"), methodJavadoc == null ? null : StringUtils.fromString(methodJavadoc));
 
         // Parameters
         Parameter[] parameters = method.getParameters();
@@ -525,7 +562,11 @@ public class JarAnalyzer {
                         BMap<BString, Object> field = ValueCreator.createMapValue(mapType);
                         field.put(StringUtils.fromString("name"), StringUtils.fromString(fieldName));
                         field.put(StringUtils.fromString("type"), StringUtils.fromString(returnTypeName));
-                        field.put(StringUtils.fromString("fullType"), StringUtils.fromString(returnType.getName()));
+                        
+                        // Use getGenericReturnType to get full type including generics (e.g., java.util.List<software.amazon.awssdk.services.s3.model.Tag>)
+                        Type genericReturnType = method.getGenericReturnType();
+                        String fullTypeName = genericReturnType.getTypeName();
+                        field.put(StringUtils.fromString("fullType"), StringUtils.fromString(fullTypeName));
                         
                         // Mark as required if detected, otherwise false
                         boolean isRequired = requiredFieldNames.contains(fieldName);
@@ -568,7 +609,20 @@ public class JarAnalyzer {
         fieldInfo.put(StringUtils.fromString("isFinal"), Modifier.isFinal(field.getModifiers()));
         fieldInfo.put(StringUtils.fromString("isDeprecated"),
                 field.isAnnotationPresent(Deprecated.class));
-        fieldInfo.put(StringUtils.fromString("javadoc"), null);
+        String fieldJavadoc = null;
+        try {
+            if (javadocIndex != null) {
+                Map<String, String> classMap = javadocIndex.get(field.getDeclaringClass().getName());
+                if (classMap == null) {
+                    classMap = javadocIndex.get(field.getDeclaringClass().getName().replace('$', '.'));
+                }
+                if (classMap != null) {
+                    String desc = classMap.get(field.getName());
+                    if (desc != null) fieldJavadoc = desc;
+                }
+            }
+        } catch (Exception ignored) {}
+        fieldInfo.put(StringUtils.fromString("javadoc"), fieldJavadoc == null ? null : StringUtils.fromString(fieldJavadoc));
 
         return fieldInfo;
     }
@@ -585,7 +639,23 @@ public class JarAnalyzer {
 
         constructorInfo.put(StringUtils.fromString("isDeprecated"),
                 constructor.isAnnotationPresent(Deprecated.class));
-        constructorInfo.put(StringUtils.fromString("javadoc"), null);
+        String ctorJavadoc = null;
+        try {
+            if (javadocIndex != null) {
+                Map<String, String> classMap = javadocIndex.get(constructor.getDeclaringClass().getName());
+                if (classMap == null) {
+                    classMap = javadocIndex.get(constructor.getDeclaringClass().getName().replace('$', '.'));
+                }
+                // constructors typically don't have a simple member name in summary; look for "<init>" or class simple name
+                if (classMap != null) {
+                    String simple = constructor.getDeclaringClass().getSimpleName();
+                    String desc = classMap.get(simple);
+                    if (desc == null) desc = classMap.get("<init>");
+                    if (desc != null) ctorJavadoc = desc;
+                }
+            }
+        } catch (Exception ignored) {}
+        constructorInfo.put(StringUtils.fromString("javadoc"), ctorJavadoc == null ? null : StringUtils.fromString(ctorJavadoc));
 
         // Parameters
         Parameter[] parameters = constructor.getParameters();

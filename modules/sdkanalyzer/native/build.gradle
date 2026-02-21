@@ -62,6 +62,8 @@ dependencies {
     // JavaParser for parsing source .java files to extract javadoc/parameter names
     implementation 'com.github.javaparser:javaparser-core:3.25.4'
     implementation 'com.github.javaparser:javaparser-symbol-solver-core:3.25.4'
+    // HTML parser for extracting javadoc descriptions
+    implementation 'org.jsoup:jsoup:1.16.1'
 }
 
 compileJava {

@@ -123,6 +123,18 @@ public function getMethodRankingUserPrompt(int methodCount, string methodsList) 
         "Important method names (comma-separated):";
 }
 
+    # User prompt for selecting top-N methods
+    # + methodCount - Total number of methods
+    # + methodsList - Formatted list of methods
+    # + n - Number of methods to select
+    # + return - User prompt for method selection
+    public function getMethodSelectionUserPrompt(int methodCount, string methodsList, int n) returns string {
+        return "From the following " + methodCount.toString() + " methods, select the most commonly used " + n.toString() + " methods that developers use most frequently.\n\n" +
+            "Return ONLY a comma-separated list of EXACT method NAMES (no numbers, no extra commentary).\n\n" +
+            "Methods:\n" + methodsList + "\n\n" +
+            "Return exactly " + n.toString() + " method names, comma-separated:";
+    }
+
 # System prompt for parameter field analysis
 #
 # + return - System prompt for analyzing parameter fields
@@ -220,4 +232,96 @@ JSON format:
 }
 
 Return ONLY the JSON object.`;
+}
+
+# System prompt for client class description
+#
+# + return - System prompt for generating client class description
+public function getClientDescriptionSystemPrompt() returns string {
+    return "You are a technical writer. Generate a brief, simple description (1-2 sentences) of what a Java SDK client class does. Be concise and practical.";
+}
+
+# User prompt for client class description
+#
+# + className - Simple class name
+# + methodCount - Number of public methods
+# + return - User prompt for client description
+public function getClientDescriptionUserPrompt(string className, int methodCount) returns string {
+    return string `Write a 1-2 sentence description of the ${className} client class. It has ${methodCount} public methods for SDK operations. Keep it simple and focus on what developers use it for.`;
+}
+
+# System prompt for method description
+#
+# + return - System prompt for generating method description
+public function getMethodDescriptionSimpleSystemPrompt() returns string {
+    return "You are a technical writer. Generate a brief, simple description (1 sentence) of what a Java method does. Be concise and practical.";
+}
+
+# User prompt for method description
+#
+# + methodName - Method name
+# + returnType - Return type
+# + return - User prompt for method description
+public function getMethodDescriptionSimpleUserPrompt(string methodName, string returnType) returns string {
+    return string `Write a 1 sentence description of what the ${methodName} method does. It returns ${returnType}. Keep it simple.`;
+}
+
+# System prompt for parameter description
+#
+# + return - System prompt for generating parameter description
+public function getParameterDescriptionSystemPrompt() returns string {
+    return "You are a technical writer. Generate a brief description (1 sentence) of what a method parameter is used for. Be concise.";
+}
+
+# User prompt for parameter description
+#
+# + paramName - Parameter name
+# + paramType - Parameter type
+# + return - User prompt for parameter description
+public function getParameterDescriptionUserPrompt(string paramName, string paramType) returns string {
+    return string `Write a 1 sentence description of what the ${paramName} parameter (type ${paramType}) is used for. Keep it simple.`;
+}
+
+# System prompt for field description
+#
+# + return - System prompt for generating field description
+public function getFieldDescriptionSystemPrompt() returns string {
+    return "You are a technical writer. Generate a brief description (1 sentence) of what a request field is used for. Be concise and practical.";
+}
+
+# User prompt for field description
+#
+# + fieldName - Field name
+# + fieldType - Field type
+# + isRequired - Whether field is required
+# + return - User prompt for field description
+public function getFieldDescriptionUserPrompt(string fieldName, string fieldType, boolean isRequired) returns string {
+    string req = isRequired ? "required" : "optional";
+    return string `Write a 1 sentence description of what the ${fieldName} field (type ${fieldType}, ${req}) is used for. Be practical.`;
+}
+
+# System prompt for field requirement analysis
+#
+# + return - System prompt for determining if fields are required
+public function getFieldRequirementSystemPrompt() returns string {
+    return "You are an expert SDK analyzer. Analyze request object fields to determine if they are required or optional. " +
+        "Return ONLY a JSON array with format: [{\"field\":\"fieldName\",\"required\":true/false,\"reason\":\"brief explanation\"}]. " +
+        "Required fields are those essential for the operation (IDs, keys, required parameters). " +
+        "Optional fields are configurations, metadata, or settings with sensible defaults.";
+}
+
+# User prompt for field requirement analysis
+#
+# + methodName - Method name for context
+# + parameterType - Parameter type name
+# + fields - List of field names and types
+# + return - User prompt for field requirement analysis
+public function getFieldRequirementUserPrompt(string methodName, string parameterType, string fields) returns string {
+    return string `
+Analyze these fields from ${parameterType} used in method ${methodName}:
+
+${fields}
+
+For each field, determine if it's REQUIRED (essential for operation) or OPTIONAL (configuration/metadata).
+Return JSON array only: [{"field":"fieldName","required":true/false,"reason":"brief explanation"}]`;
 }

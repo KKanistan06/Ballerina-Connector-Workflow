@@ -102,6 +102,33 @@ public type AnalyzerConfig record {|
     string? sourcesPath = ();
     # Disable LLM calls for descriptions and enrichment
     boolean disableLLM = false;
+    # Number of methods to include in the generated metadata (N). If the class
+    # has fewer methods than this, all methods will be included.
+    int methodsToList = 40;
+    # Optional path to a javadoc JAR file for extracting descriptions
+    string? javadocPath = ();
+|};
+
+# Result of parsing a JAR with its dependency information
+public type ParsedJarResult record {|
+    # All classes extracted from the main JAR
+    ClassInfo[] classes;
+    # Paths to all dependency JAR files (for lazy class resolution)
+    string[] dependencyJarPaths;
+|};
+
+# A single configurable field exposed by a client builder / factory
+public type ConnectionFieldInfo record {|
+    # Field name (setter method name without prefix, camelCase)
+    string name;
+    # Simple type name
+    string typeName;
+    # Fully qualified type name
+    string fullType;
+    # Whether the field is required for initialization
+    boolean isRequired;
+    # Description from javadoc (if available)
+    string? description = ();
 |};
 
 # Client initialization pattern metadata
@@ -114,6 +141,10 @@ public type ClientInitPattern record {|
     string? explanation = ();
     # Detection origin (llm|heuristic|error)
     string detectedBy;
+    # Fully qualified name of the resolved builder class (if pattern is builder)
+    string? builderClass = ();
+    # Connection / configuration fields exposed by the builder hierarchy
+    ConnectionFieldInfo[] connectionFields = [];
 |};
 
 # Complete SDK metadata extracted from JAR.
@@ -210,6 +241,8 @@ public type RequestFieldOutput record {|
     string? description = ();
     # Enum values if this field is an enum type (reference to cached enum)
     string? enumReference = ();
+    # Reference to member class for List/Map/Collection types (the generic type parameter)
+    string? memberReference = ();
 |};
 
 # Metadata for a method/constructor parameter.
@@ -220,8 +253,6 @@ public type ParameterMetadata record {|
     string paramType;
     # Simple type name
     string paramTypeSimple;
-    # Human-readable description of this parameter
-    string? description = ();
     # Request object fields (if this parameter is a Request class)
     RequestFieldOutput[]? requestFields = ();
 |};
@@ -364,6 +395,8 @@ public type MethodInfo record {|
     ParameterInfo[] parameters;
     # Return type (fully qualified)
     string returnType;
+    # Return object fields (if the return type is a Response class)
+    RequestFieldInfo[]? returnFields = ();
     # Exceptions that can be thrown
     string[] exceptions;
     # Specifies whether method is static
@@ -374,14 +407,14 @@ public type MethodInfo record {|
     boolean isAbstract;
     # Method signature (for uniqueness)
     string signature;
-    # Javadoc comment (if available)
-    string? javadoc;
     # Specifies whether this method is deprecated
     boolean isDeprecated;
     # Generic type parameters (if any)
     string[] typeParameters;
     # Annotation names present on the method
     string[] annotations;
+    # User-friendly description of what this method does
+    string? description = ();
 |};
 
 # Raw parameter information.
@@ -531,10 +564,12 @@ public type RequestFieldInfo record {|
     string fullType;
     # Whether this field is required
     boolean isRequired;
-    # Human-readable description of this field
-    string? description = ();
     # Enum values if this field is an enum type (reference to cached enum)
     string? enumReference = ();
+    # Reference to member class for List/Map/Collection types (the generic type parameter)
+    string? memberReference = ();
+    # User-friendly description of what this field represents
+    string? description = ();
 |};
 
 # Root client class information
@@ -565,6 +600,18 @@ public type SupportingClassInfo record {|
     string purpose;
 |};
 
+# Member class information (for classes referenced in List/Map generic types)
+public type MemberClassInfo record {|
+    # Fully qualified class name
+    string className;
+    # Simple class name
+    string simpleName;
+    # Package name
+    string packageName;
+    # Fields of this member class
+    RequestFieldInfo[] fields;
+|};
+
 # SDK information
 public type SDKInfo record {|
     # SDK name
@@ -588,21 +635,15 @@ public type AnalysisSummary record {|
 |};
 
 # Enum value information
-public type EnumValueInfo record {|
-    # Enum constant name
-    string name;
-    # Enum ordinal value
-    int ordinal;
-|};
-
-# Enum metadata for referenced enum types
+## Enum metadata for referenced enum types
 public type EnumMetadata record {|
     # Fully qualified enum class name
     string enumClassName;
     # Simple enum class name
     string simpleName;
-    # Enum constant values
-    EnumValueInfo[] values;
+    # Enum constant values represented as strings. The default value (if detected)
+    # will be annotated with " - default" in the string.
+    string[] values;
 |};
 
 # Complete structured SDK metadata (final output)
@@ -615,6 +656,8 @@ public type StructuredSDKMetadata record {|
     RootClientInfo rootClient;
     # Supporting classes used by the client
     SupportingClassInfo[] supportingClasses;
+    # Member classes referenced in List/Map types (keyed by fully qualified class name)
+    map<MemberClassInfo> memberClasses;
     # Enum types referenced in parameters (keyed by fully qualified enum class name)
     map<EnumMetadata> enums;
     # Analysis summary

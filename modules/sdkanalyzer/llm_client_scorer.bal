@@ -53,7 +53,6 @@ function callLLMForClientScoring(ClassInfo cls, ClassInfo[] allClasses) returns 
         return response;
     }
     
-    if response is json {
         // Extract text from Anthropic API response structure: response.content[0].text
         string responseText = "";
         
@@ -109,7 +108,6 @@ function callLLMForClientScoring(ClassInfo cls, ClassInfo[] allClasses) returns 
                 }
             }
         }
-    }
     
     return error("Failed to parse LLM response for client scoring");
 }

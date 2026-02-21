@@ -1,19 +1,4 @@
 // Copyright (c) 2026 WSO2 LLC. (http://www.wso2.com).
-//
-// WSO2 LLC. licenses this file to you under the Apache License,
-// Version 2.0 (the "License"); you may not use this file except
-// in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied. See the License for the
-// specific language governing permissions and limitations
-// under the License.
-
 package io.ballerina.connector.automator.sdkanalyzer;
 
 import com.github.javaparser.JavaParser;
@@ -71,6 +56,37 @@ public class JavaParserAnalyzer {
             "sun", "com.sun", "jdk", "java.lang", "java.util", "java.io", 
             "java.net", "java.time", "java.concurrent", "javax"
     );
+    // Optional javadoc index: classFQN -> (memberName -> description)
+    private static Map<String, Map<String, String>> javadocIndex = null;
+
+    // Helper to find a javadoc map for a given class name. The javadoc index may contain
+    // variants like "...class-use.ClassName" or inner-class dollar variants. Try several
+    // heuristics to locate the most appropriate entry.
+    private static Map<String, String> findJavadocMapForClass(String className) {
+        if (javadocIndex == null || className == null) return null;
+        // Exact match
+        Map<String, String> map = javadocIndex.get(className);
+        if (map != null) return map;
+
+        // Try dot/dollar variant
+        map = javadocIndex.get(className.replace('$', '.'));
+        if (map != null) return map;
+
+        // Simple name match: look for keys that end with ".SimpleName" or ".class-use.SimpleName"
+        int lastDot = className.lastIndexOf('.');
+        String simple = (lastDot >= 0) ? className.substring(lastDot + 1) : className;
+
+        for (String key : javadocIndex.keySet()) {
+            if (key.endsWith("." + simple) || key.endsWith(".class-use." + simple) || key.endsWith("$" + simple) || key.equals(simple)) {
+                return javadocIndex.get(key);
+            }
+            // also try contains pattern (fallback)
+            if (key.contains("." + simple + "")) {
+                return javadocIndex.get(key);
+            }
+        }
+        return null;
+    }
 
     /**
      * Analyze JAR using JavaParser approach.
@@ -132,18 +148,57 @@ public class JavaParserAnalyzer {
 
             // Check for explicit sourcesPath in the resolution map (if provided)
             String explicitSourcesPath = null;
+            String explicitJavadocPath = null;
             if (jarPathOrResult instanceof BMap) {
                 BMap<BString, Object> mavenResult = (BMap<BString, Object>) jarPathOrResult;
                 Object sourcesObj = mavenResult.get(StringUtils.fromString("sourcesPath"));
                 if (sourcesObj != null) {
                     explicitSourcesPath = sourcesObj.toString();
                 }
+                Object javadocObj = mavenResult.get(StringUtils.fromString("javadocPath"));
+                if (javadocObj != null) {
+                    explicitJavadocPath = javadocObj.toString();
+                }
             }
 
             Map<String, CompilationUnit> parsedSources = extractAndParseSourceFiles(jarFiles, explicitSourcesPath);
 
-            System.err.println("DEBUG: explicitSourcesPath=" + explicitSourcesPath);
             System.err.println("INFO: Parsed " + parsedSources.size() + " source files");
+
+            // Load javadoc from explicit path or auto-discover
+            try {
+                if (explicitJavadocPath != null && !explicitJavadocPath.isEmpty()) {
+                    // Use explicitly provided javadoc JAR path
+                    File javadocJar = new File(explicitJavadocPath);
+                    if (javadocJar.exists()) {
+                        System.err.println("INFO: Loading javadoc from explicit path: " + javadocJar.getAbsolutePath());
+                        javadocIndex = JavadocExtractor.loadFromJar(javadocJar);
+                        int size = javadocIndex == null ? 0 : javadocIndex.size();
+                        System.err.println("INFO: Loaded javadoc entries for " + size + " classes");
+                    } else {
+                        System.err.println("WARNING: Explicit javadoc JAR not found: " + explicitJavadocPath);
+                    }
+                } else {
+                    // Try to auto-discover javadoc JAR
+                    File mainJarFile = new File(mainJarPath);
+                    File parent = mainJarFile.getParentFile();
+                    if (parent != null && parent.exists()) {
+                        File[] candidates = parent.listFiles((dir, name) -> name.toLowerCase().contains("javadoc") && name.endsWith(".jar"));
+                        if (candidates == null || candidates.length == 0) {
+                            // No javadoc JAR found
+                        } else {
+                            File javadocJar = candidates[0];
+                            System.err.println("INFO: Found javadoc jar: " + javadocJar.getAbsolutePath());
+                            javadocIndex = JavadocExtractor.loadFromJar(javadocJar);
+                            int size = javadocIndex == null ? 0 : javadocIndex.size();
+                            System.err.println("INFO: Loaded javadoc entries for " + size + " classes");
+                        }
+                    }
+                }
+
+            } catch (Exception e) {
+                System.err.println("WARNING: JavaParserAnalyzer javadoc loading failed: " + e.getMessage());
+            }
             
             // 3. For each class, create metadata using JavaParser + ASM fallback
             for (String className : classNames) {
@@ -172,6 +227,74 @@ public class JavaParserAnalyzer {
             e.printStackTrace();
             return ErrorCreator.createError(
                     StringUtils.fromString("JavaParser analysis failed: " + e.getMessage()));
+        }
+    }
+    
+    /**
+     * Resolve a single class from a list of JAR files.
+     * This is used for lazy resolution of external dependency classes (e.g., parent builder classes).
+     *
+     * @param className Fully qualified class name to resolve
+     * @param jarPaths Array of JAR file paths to search
+     * @return Class info BMap or null if not found
+     */
+    public static Object resolveClassFromJars(BString className, BArray jarPaths) {
+        try {
+            String classNameStr = className.getValue();
+            List<File> jarFiles = new ArrayList<>();
+            
+            for (int i = 0; i < jarPaths.getLength(); i++) {
+                String jarPath = jarPaths.getBString(i).getValue();
+                File jarFile = new File(jarPath);
+                if (jarFile.exists()) {
+                    jarFiles.add(jarFile);
+                }
+            }
+            
+            if (jarFiles.isEmpty()) {
+                return null;
+            }
+            
+            // Try to analyze the class with ASM from the JAR files
+            MapType mapType = TypeCreator.createMapType(PredefinedTypes.TYPE_JSON);
+            BMap<BString, Object> classInfo = ValueCreator.createMapValue(mapType);
+            
+            // Basic class information
+            classInfo.put(StringUtils.fromString("className"), StringUtils.fromString(classNameStr));
+            
+            String packageName = "";
+            String simpleName = classNameStr;
+            if (classNameStr.contains(".")) {
+                int lastDot = classNameStr.lastIndexOf(".");
+                packageName = classNameStr.substring(0, lastDot);
+                simpleName = classNameStr.substring(lastDot + 1);
+            }
+            
+            classInfo.put(StringUtils.fromString("packageName"), StringUtils.fromString(packageName));
+            classInfo.put(StringUtils.fromString("simpleName"), StringUtils.fromString(simpleName));
+            
+            // Try to find and analyze with ASM
+            BMap<BString, Object> result = analyzeWithASM(classNameStr, jarFiles, classInfo);
+            
+            // Check if we found the class (it will have methods if found)
+            Object methods = result.get(StringUtils.fromString("methods"));
+            if (methods instanceof BArray) {
+                BArray methodsArray = (BArray) methods;
+                // If we have at least one method or the class has interfaces/superClass, we found it
+                Object superClass = result.get(StringUtils.fromString("superClass"));
+                Object interfaces = result.get(StringUtils.fromString("interfaces"));
+                if (methodsArray.getLength() > 0 || superClass != null || 
+                    (interfaces instanceof BArray && ((BArray) interfaces).getLength() > 0)) {
+                    System.err.println("INFO: Resolved external class: " + classNameStr);
+                    return result;
+                }
+            }
+            
+            return null;
+            
+        } catch (Exception e) {
+            System.err.println("WARNING: Failed to resolve class " + className.getValue() + ": " + e.getMessage());
+            return null;
         }
     }
     
@@ -255,7 +378,6 @@ public class JavaParserAnalyzer {
                             JarEntry entry = entries.nextElement();
                             String entryName = entry.getName();
                                 if (entryName.endsWith(".java")) {
-                                System.err.println("DEBUG: Found source entry: " + entryName);
                                 try (InputStream inputStream = srcJar.getInputStream(entry)) {
                                     String content = new String(inputStream.readAllBytes());
                                     try {
@@ -267,9 +389,6 @@ public class JavaParserAnalyzer {
                                             String className = extractClassNameFromCU(cu, entryName);
                                             if (className != null) {
                                                 parsedSources.put(className, cu);
-                                                System.err.println("DEBUG: Parsed source for class: " + className);
-                                            } else {
-                                                System.err.println("DEBUG: Parsed but could not determine class name for: " + entryName);
                                             }
                                         } else {
                                             System.err.println("WARNING: parse returned empty for " + entryName + ", problems=" + parseResult.getProblems());
@@ -537,7 +656,7 @@ public class JavaParserAnalyzer {
             List<BMap<BString, Object>> methods = new ArrayList<>();
             for (MethodDeclaration method : classDecl.getMethods()) {
                 if (method.isPublic()) {
-                    methods.add(analyzeMethodWithJavaParser(method, mapType));
+                    methods.add(analyzeMethodWithJavaParser(className, method, mapType));
                 }
             }
             classInfo.put(StringUtils.fromString("methods"),
@@ -548,7 +667,7 @@ public class JavaParserAnalyzer {
             List<BMap<BString, Object>> fields = new ArrayList<>();
             for (FieldDeclaration field : classDecl.getFields()) {
                 if (field.isPublic()) {
-                    fields.addAll(analyzeFieldWithJavaParser(field, mapType));
+                    fields.addAll(analyzeFieldWithJavaParser(className, field, mapType));
                 }
             }
             classInfo.put(StringUtils.fromString("fields"),
@@ -559,7 +678,7 @@ public class JavaParserAnalyzer {
             List<BMap<BString, Object>> constructors = new ArrayList<>();
             for (ConstructorDeclaration constructor : classDecl.getConstructors()) {
                 if (constructor.isPublic()) {
-                    constructors.add(analyzeConstructorWithJavaParser(constructor, mapType));
+                    constructors.add(analyzeConstructorWithJavaParser(className, constructor, mapType));
                 }
             }
             classInfo.put(StringUtils.fromString("constructors"),
@@ -587,8 +706,8 @@ public class JavaParserAnalyzer {
      * @param mapType Map type for creating values
      * @return Method information map
      */
-    private static BMap<BString, Object> analyzeMethodWithJavaParser(
-            MethodDeclaration method, MapType mapType) {
+        private static BMap<BString, Object> analyzeMethodWithJavaParser(
+            String className, MethodDeclaration method, MapType mapType) {
         
         BMap<BString, Object> methodInfo = ValueCreator.createMapValue(mapType);
         
@@ -600,30 +719,79 @@ public class JavaParserAnalyzer {
         methodInfo.put(StringUtils.fromString("isAbstract"), method.isAbstract());
         methodInfo.put(StringUtils.fromString("isDeprecated"), method.isAnnotationPresent("Deprecated"));
         
-        // Javadoc
+        // Javadoc: prefer inline source javadoc, fallback to extracted javadoc index
         Optional<JavadocComment> javadoc = method.getJavadocComment();
         if (javadoc.isPresent()) {
-            methodInfo.put(StringUtils.fromString("javadoc"), 
+            methodInfo.put(StringUtils.fromString("javadoc"),
                     StringUtils.fromString(javadoc.get().getContent()));
         } else {
-            methodInfo.put(StringUtils.fromString("javadoc"), null);
+            String fallback = null;
+            try {
+                Map<String, String> classMap = findJavadocMapForClass(className);
+                if (classMap != null) {
+                    // Try exact method name first; then try some normalized variants
+                    String mname = method.getNameAsString();
+                    String desc = classMap.get(mname);
+                    if (desc == null) {
+                        // some javadocs include suffixes or builder qualifiers; try last token
+                        int dot = mname.lastIndexOf('.');
+                        if (dot >= 0) desc = classMap.get(mname.substring(dot + 1));
+                    }
+                    if (desc == null) {
+                        // try method + "()" form
+                        desc = classMap.get(method.getNameAsString() + "()");
+                    }
+                    if (desc != null) fallback = desc;
+                }
+            } catch (Exception ignored) {}
+            methodInfo.put(StringUtils.fromString("javadoc"), fallback == null ? null : StringUtils.fromString(fallback));
         }
         
-        // Parameters
+            // Parameters
         List<BMap<BString, Object>> paramList = new ArrayList<>();
         for (Parameter param : method.getParameters()) {
             BMap<BString, Object> paramInfo = ValueCreator.createMapValue(mapType);
             paramInfo.put(StringUtils.fromString("name"), StringUtils.fromString(param.getNameAsString()));
             paramInfo.put(StringUtils.fromString("type"), StringUtils.fromString(param.getTypeAsString()));
             paramInfo.put(StringUtils.fromString("isVarArgs"), param.isVarArgs());
-            
-            // Extract request fields if this is a Request parameter
-            if (param.getTypeAsString().endsWith("Request")) {
-                // This would need additional analysis of the Request class
-                // For now, leave it empty - could be enhanced later
-                paramInfo.put(StringUtils.fromString("requestFields"), 
-                        ValueCreator.createArrayValue(new BMap[0], TypeCreator.createArrayType(mapType)));
-            }
+                // Extract request fields if this is a Request parameter
+                if (param.getTypeAsString().endsWith("Request")) {
+                    // Try to populate simple request field descriptions from the javadoc index
+                    try {
+                        Map<String, String> classMap = findJavadocMapForClass(param.getTypeAsString());
+                        if (classMap == null) {
+                            // also try builder variant
+                            classMap = findJavadocMapForClass(param.getTypeAsString() + ".Builder");
+                        }
+
+                        if (classMap != null && !classMap.isEmpty()) {
+                            List<BMap<BString, Object>> rflds = new ArrayList<>();
+                            for (Map.Entry<String, String> e : classMap.entrySet()) {
+                                String member = e.getKey();
+                                String desc = e.getValue();
+                                // Skip synthetic-looking entries
+                                if (member == null || member.isBlank()) continue;
+                                // Only include simple member names (no generics/signatures)
+                                if (member.contains("<") || member.contains(" ")) continue;
+
+                                BMap<BString, Object> f = ValueCreator.createMapValue(mapType);
+                                f.put(StringUtils.fromString("name"), StringUtils.fromString(member));
+                                f.put(StringUtils.fromString("type"), StringUtils.fromString(""));
+                                f.put(StringUtils.fromString("isDeprecated"), false);
+                                f.put(StringUtils.fromString("javadoc"), desc == null ? null : StringUtils.fromString(desc));
+                                rflds.add(f);
+                            }
+                            paramInfo.put(StringUtils.fromString("requestFields"),
+                                    ValueCreator.createArrayValue(rflds.toArray(new BMap[0]), TypeCreator.createArrayType(mapType)));
+                        } else {
+                            paramInfo.put(StringUtils.fromString("requestFields"),
+                                    ValueCreator.createArrayValue(new BMap[0], TypeCreator.createArrayType(mapType)));
+                        }
+                    } catch (Exception ignored) {
+                        paramInfo.put(StringUtils.fromString("requestFields"),
+                                ValueCreator.createArrayValue(new BMap[0], TypeCreator.createArrayType(mapType)));
+                    }
+                }
             
             paramList.add(paramInfo);
         }
@@ -651,8 +819,8 @@ public class JavaParserAnalyzer {
      * @param mapType Map type for creating values
      * @return List of field information maps (one per variable)
      */
-    private static List<BMap<BString, Object>> analyzeFieldWithJavaParser(
-            FieldDeclaration field, MapType mapType) {
+        private static List<BMap<BString, Object>> analyzeFieldWithJavaParser(
+            String className, FieldDeclaration field, MapType mapType) {
         
         List<BMap<BString, Object>> fields = new ArrayList<>();
         
@@ -665,13 +833,26 @@ public class JavaParserAnalyzer {
             fieldInfo.put(StringUtils.fromString("isFinal"), field.isFinal());
             fieldInfo.put(StringUtils.fromString("isDeprecated"), field.isAnnotationPresent("Deprecated"));
             
-            // Javadoc
+            // Javadoc: prefer inline source javadoc, fallback to extracted javadoc index
             Optional<JavadocComment> javadoc = field.getJavadocComment();
             if (javadoc.isPresent()) {
-                fieldInfo.put(StringUtils.fromString("javadoc"), 
+                fieldInfo.put(StringUtils.fromString("javadoc"),
                         StringUtils.fromString(javadoc.get().getContent()));
             } else {
-                fieldInfo.put(StringUtils.fromString("javadoc"), null);
+                String fallback = null;
+                try {
+                    Map<String, String> classMap = findJavadocMapForClass(className);
+                    if (classMap != null) {
+                        String fname = variable.getNameAsString();
+                        String desc = classMap.get(fname);
+                        if (desc == null) {
+                            int dot = fname.lastIndexOf('.');
+                            if (dot >= 0) desc = classMap.get(fname.substring(dot + 1));
+                        }
+                        if (desc != null) fallback = desc;
+                    }
+                } catch (Exception ignored) {}
+                fieldInfo.put(StringUtils.fromString("javadoc"), fallback == null ? null : StringUtils.fromString(fallback));
             }
             
             fields.add(fieldInfo);
@@ -687,20 +868,35 @@ public class JavaParserAnalyzer {
      * @param mapType Map type for creating values
      * @return Constructor information map
      */
-    private static BMap<BString, Object> analyzeConstructorWithJavaParser(
-            ConstructorDeclaration constructor, MapType mapType) {
+        private static BMap<BString, Object> analyzeConstructorWithJavaParser(
+            String className, ConstructorDeclaration constructor, MapType mapType) {
         
         BMap<BString, Object> constructorInfo = ValueCreator.createMapValue(mapType);
         
         constructorInfo.put(StringUtils.fromString("isDeprecated"), constructor.isAnnotationPresent("Deprecated"));
         
-        // Javadoc
+        // Javadoc: prefer inline source javadoc, fallback to extracted javadoc index
         Optional<JavadocComment> javadoc = constructor.getJavadocComment();
         if (javadoc.isPresent()) {
-            constructorInfo.put(StringUtils.fromString("javadoc"), 
+            constructorInfo.put(StringUtils.fromString("javadoc"),
                     StringUtils.fromString(javadoc.get().getContent()));
         } else {
-            constructorInfo.put(StringUtils.fromString("javadoc"), null);
+            String fallback = null;
+            try {
+                if (javadocIndex != null) {
+                    Map<String, String> classMap = javadocIndex.get(className);
+                    if (classMap == null) {
+                        classMap = javadocIndex.get(className.replace('$', '.'));
+                    }
+                    if (classMap != null) {
+                        String simple = constructor.getNameAsString();
+                        String desc = classMap.get(simple);
+                        if (desc == null) desc = classMap.get("<init>");
+                        if (desc != null) fallback = desc;
+                    }
+                }
+            } catch (Exception ignored) {}
+            constructorInfo.put(StringUtils.fromString("javadoc"), fallback == null ? null : StringUtils.fromString(fallback));
         }
         
         // Parameters
@@ -865,7 +1061,21 @@ public class JavaParserAnalyzer {
                 fieldInfo.put(StringUtils.fromString("isStatic"), true);
                 fieldInfo.put(StringUtils.fromString("isFinal"), true);
                 fieldInfo.put(StringUtils.fromString("isDeprecated"), false);
-                fieldInfo.put(StringUtils.fromString("javadoc"), null);
+                // Try to attach javadoc from extracted index if available
+                String enumFieldJavadoc = null;
+                try {
+                    if (javadocIndex != null) {
+                        Map<String, String> classMap = javadocIndex.get(enumClassName);
+                        if (classMap == null) {
+                            classMap = javadocIndex.get(enumClassName.replace('$', '.'));
+                        }
+                        if (classMap != null) {
+                            String desc = classMap.get(name);
+                            if (desc != null) enumFieldJavadoc = desc;
+                        }
+                    }
+                } catch (Exception ignored) {}
+                fieldInfo.put(StringUtils.fromString("javadoc"), enumFieldJavadoc == null ? null : StringUtils.fromString(enumFieldJavadoc));
                 fields.add(fieldInfo);
             }
             
@@ -881,13 +1091,36 @@ public class JavaParserAnalyzer {
                 BMap<BString, Object> methodInfo = ValueCreator.createMapValue(mapType);
                 
                 methodInfo.put(StringUtils.fromString("name"), StringUtils.fromString(name));
-                methodInfo.put(StringUtils.fromString("returnType"), 
-                        StringUtils.fromString(extractReturnTypeFromDescriptor(descriptor)));
+                
+                // Use signature to extract generic return type if available, otherwise fallback to descriptor
+                String returnType;
+                if (signature != null && !signature.isEmpty()) {
+                    returnType = extractReturnTypeFromSignature(signature);
+                } else {
+                    returnType = extractReturnTypeFromDescriptor(descriptor);
+                }
+                methodInfo.put(StringUtils.fromString("returnType"), StringUtils.fromString(returnType));
+                
                 methodInfo.put(StringUtils.fromString("isStatic"), (access & Opcodes.ACC_STATIC) != 0);
                 methodInfo.put(StringUtils.fromString("isFinal"), (access & Opcodes.ACC_FINAL) != 0);
                 methodInfo.put(StringUtils.fromString("isAbstract"), (access & Opcodes.ACC_ABSTRACT) != 0);
                 methodInfo.put(StringUtils.fromString("isDeprecated"), false); // Would need annotation analysis
-                methodInfo.put(StringUtils.fromString("javadoc"), null);
+                // Attach javadoc from index if available (ASM has no inline javadoc)
+                String methodJavadoc = null;
+                try {
+                    if (javadocIndex != null) {
+                        Map<String, String> classMap = javadocIndex.get(enumClassName);
+                        if (classMap == null) {
+                            classMap = javadocIndex.get(enumClassName.replace('$', '.'));
+                        }
+                        if (classMap != null) {
+                            String desc = classMap.get(name.equals("<init>") ? enumClassName.substring(enumClassName.lastIndexOf('.') + 1) : name);
+                            if (desc == null && name.equals("<init>")) desc = classMap.get("<init>");
+                            if (desc != null) methodJavadoc = desc;
+                        }
+                    }
+                } catch (Exception ignored) {}
+                methodInfo.put(StringUtils.fromString("javadoc"), methodJavadoc == null ? null : StringUtils.fromString(methodJavadoc));
                 
                 // Basic parameter extraction from descriptor
                 String[] paramTypes = extractParameterTypesFromDescriptor(descriptor);
@@ -943,6 +1176,147 @@ public class JavaParserAnalyzer {
         private String extractReturnTypeFromDescriptor(String descriptor) {
             int returnStart = descriptor.indexOf(')') + 1;
             return descriptorToClassName(descriptor.substring(returnStart));
+        }
+        
+        /**
+         * Extract return type from generic signature (preserves generic type parameters).
+         * Signature format: ()Ljava/util/List<Lsoftware/amazon/awssdk/services/s3/model/Tag;>;
+         * Returns: java.util.List<software.amazon.awssdk.services.s3.model.Tag>
+         */
+        private String extractReturnTypeFromSignature(String signature) {
+            int returnStart = signature.indexOf(')') + 1;
+            String returnPart = signature.substring(returnStart);
+            return signatureToTypeName(returnPart);
+        }
+        
+        /**
+         * Convert a generic signature to a readable type name.
+         * Handles nested generics like Map<String, List<Tag>>
+         */
+        private String signatureToTypeName(String sig) {
+            if (sig == null || sig.isEmpty()) {
+                return sig;
+            }
+            
+            // Handle primitive types
+            if (sig.length() == 1) {
+                switch (sig.charAt(0)) {
+                    case 'V': return "void";
+                    case 'Z': return "boolean";
+                    case 'B': return "byte";
+                    case 'C': return "char";
+                    case 'S': return "short";
+                    case 'I': return "int";
+                    case 'J': return "long";
+                    case 'F': return "float";
+                    case 'D': return "double";
+                }
+            }
+            
+            // Handle array types
+            if (sig.startsWith("[")) {
+                return signatureToTypeName(sig.substring(1)) + "[]";
+            }
+            
+            // Handle object types (L...;)
+            if (sig.startsWith("L")) {
+                // Find the end - need to handle nested <> properly
+                int depth = 0;
+                int end = 1;
+                while (end < sig.length()) {
+                    char c = sig.charAt(end);
+                    if (c == '<') depth++;
+                    else if (c == '>') depth--;
+                    else if (c == ';' && depth == 0) break;
+                    end++;
+                }
+                
+                String inner = sig.substring(1, end);
+                
+                // Check for generic parameters
+                int genericStart = inner.indexOf('<');
+                if (genericStart >= 0) {
+                    String baseType = inner.substring(0, genericStart).replace('/', '.');
+                    String genericPart = inner.substring(genericStart);
+                    String parsedGenerics = parseGenericPart(genericPart);
+                    return baseType + parsedGenerics;
+                } else {
+                    return inner.replace('/', '.');
+                }
+            }
+            
+            // Handle type variables (e.g., T)
+            if (sig.startsWith("T")) {
+                int end = sig.indexOf(';');
+                if (end > 0) {
+                    return sig.substring(1, end);
+                }
+            }
+            
+            return sig.replace('/', '.');
+        }
+        
+        /**
+         * Parse generic part of a signature like <Ljava/lang/String;Ljava/util/List<Ljava/lang/Integer;>;>
+         * Returns: <java.lang.String, java.util.List<java.lang.Integer>>
+         */
+        private String parseGenericPart(String genericPart) {
+            if (!genericPart.startsWith("<") || !genericPart.endsWith(">")) {
+                return genericPart;
+            }
+            
+            String inner = genericPart.substring(1, genericPart.length() - 1);
+            StringBuilder result = new StringBuilder("<");
+            
+            int i = 0;
+            boolean first = true;
+            while (i < inner.length()) {
+                if (!first) {
+                    result.append(", ");
+                }
+                first = false;
+                
+                char c = inner.charAt(i);
+                
+                // Handle wildcards
+                if (c == '+' || c == '-') {
+                    // Skip wildcard indicator
+                    i++;
+                    c = inner.charAt(i);
+                }
+                
+                if (c == '*') {
+                    result.append("?");
+                    i++;
+                } else if (c == 'L') {
+                    // Object type - find matching ;
+                    int depth = 0;
+                    int end = i + 1;
+                    while (end < inner.length()) {
+                        char ec = inner.charAt(end);
+                        if (ec == '<') depth++;
+                        else if (ec == '>') depth--;
+                        else if (ec == ';' && depth == 0) break;
+                        end++;
+                    }
+                    
+                    String typeStr = inner.substring(i, end + 1);
+                    result.append(signatureToTypeName(typeStr));
+                    i = end + 1;
+                } else if (c == 'T') {
+                    // Type variable
+                    int end = inner.indexOf(';', i);
+                    result.append(inner.substring(i + 1, end));
+                    i = end + 1;
+                } else {
+                    // Primitive type
+                    result.append(signatureToTypeName(String.valueOf(c)));
+                    i++;
+                }
+            }
+            
+            result.append(">");
+            return result.toString();
         }
         
         private String[] extractParameterTypesFromDescriptor(String descriptor) {
@@ -1008,5 +1382,81 @@ public class JavaParserAnalyzer {
             return null;
         }
         return analyzeJarWithJavaParser(jarPath.getValue());
+    }
+
+    /**
+     * Extract filtered javadoc for specific classes and members.
+     * This is more efficient than loading all javadoc entries when you only need specific ones.
+     *
+     * @param javadocPath Path to the javadoc JAR file
+     * @param classNames Array of fully-qualified class names to extract
+     * @param memberNames Array of member names to extract (optional; if null/empty, extract all)
+     * @return JSON map of class FQNs to member descriptions
+     */
+    public static Object extractFilteredJavadoc(BString javadocPath, BArray classNames, BArray memberNames) {
+        try {
+            if (javadocPath == null || javadocPath.getValue().isEmpty()) {
+                return ValueCreator.createMapValue(TypeCreator.createMapType(PredefinedTypes.TYPE_STRING));
+            }
+
+            File javadocJar = new File(javadocPath.getValue());
+            if (!javadocJar.exists()) {
+                System.err.println("WARNING: extractFilteredJavadoc: javadoc JAR not found: " + javadocJar.getAbsolutePath());
+                return ValueCreator.createMapValue(TypeCreator.createMapType(PredefinedTypes.TYPE_STRING));
+            }
+
+            // Convert BArray to Set<String>
+            Set<String> targetClasses = new java.util.HashSet<>();
+            if (classNames != null) {
+                for (int i = 0; i < classNames.getLength(); i++) {
+                    String cn = classNames.getBString(i).getValue();
+                    if (cn != null && !cn.isEmpty()) {
+                        targetClasses.add(cn);
+                    }
+                }
+            }
+
+            Set<String> targetMembers = new java.util.HashSet<>();
+            if (memberNames != null) {
+                for (int i = 0; i < memberNames.getLength(); i++) {
+                    String mn = memberNames.getBString(i).getValue();
+                    if (mn != null && !mn.isEmpty()) {
+                        targetMembers.add(mn);
+                    }
+                }
+            }
+
+            System.err.println("INFO: extractFilteredJavadoc: loading javadoc for " + targetClasses.size() + " classes and " + targetMembers.size() + " member names");
+
+            // Use the filtered loading method
+            Map<String, Map<String, String>> filteredJavadoc = JavadocExtractor.loadFilteredFromJar(
+                    javadocJar,
+                    targetClasses,
+                    targetMembers.isEmpty() ? null : targetMembers
+            );
+
+            // Convert to Ballerina map<string|map<string>>
+            BMap<BString, Object> resultMap = ValueCreator.createMapValue(TypeCreator.createMapType(PredefinedTypes.TYPE_JSON));
+            
+            for (String className : filteredJavadoc.keySet()) {
+                Map<String, String> memberDescs = filteredJavadoc.get(className);
+                BMap<BString, Object> memberMap = ValueCreator.createMapValue(TypeCreator.createMapType(PredefinedTypes.TYPE_STRING));
+                
+                for (String memberName : memberDescs.keySet()) {
+                    String description = memberDescs.get(memberName);
+                    memberMap.put(StringUtils.fromString(memberName), StringUtils.fromString(description));
+                }
+                
+                resultMap.put(StringUtils.fromString(className), memberMap);
+            }
+
+            System.err.println("INFO: extractFilteredJavadoc: extracted javadoc for " + filteredJavadoc.size() + " classes");
+            return resultMap;
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            System.err.println("ERROR: extractFilteredJavadoc failed: " + e.getMessage());
+            return ValueCreator.createMapValue(TypeCreator.createMapType(PredefinedTypes.TYPE_STRING));
+        }
     }
 }
