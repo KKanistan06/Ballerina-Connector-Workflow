@@ -17,7 +17,7 @@ import ballerina/regex;
 import ballerina/io;
 import ballerina/os;
 
-# Use Anthropic LLM to find root client class using weighted scoring
+# Use Anthropic LLM to find root client class using weighted scoring.
 #
 # + classes - All classes from SDK
 # + maxCandidates - Maximum number of candidates to consider
@@ -88,7 +88,7 @@ public function identifyClientClassWithLLM(ClassInfo[] classes, int maxCandidate
     return sorted.slice(0, finalCount);
 }
 
-# Detect class initialization pattern using LLM
+# Detect class initialization pattern using LLM.
 #
 # + rootClient - The identified root client class
 # + allClasses - All classes available in the JAR (for builder hierarchy resolution)
@@ -117,7 +117,7 @@ public function detectClientInitPatternWithLLM(ClassInfo rootClient, ClassInfo[]
     return pattern;
 }
 
-# Extract all public methods from root client class
+# Extract all public methods from root client class.
 #
 # + rootClient - The root client class
 # + return - All public methods with metadata
@@ -135,7 +135,7 @@ public function extractPublicMethods(ClassInfo rootClient) returns MethodInfo[] 
     return publicMethods;
 }
 
-# Use LLM to rank methods by usage frequency  
+# Use LLM to rank methods by usage frequency.
 #
 # + methods - All public methods from root client
 # + return - Methods ranked by usage frequency
@@ -153,7 +153,7 @@ public function rankMethodsByUsageWithLLM(MethodInfo[] methods) returns MethodIn
     return rankMethodsUsingLLM(methods);
 }
 
-# Extract request/response parameters and corresponding fields with types
+# Extract request/response parameters and corresponding fields with types.
 #
 # + methods - Methods to analyze for parameters
 # + allClasses - All classes for type lookup
@@ -243,7 +243,7 @@ public function extractParameterFieldTypes(MethodInfo[] methods, ClassInfo[] all
     return enhancedMethodsOrdered;
 }
 
-# Generate structured metadata with all information
+# Generate structured metadata with all information.
 #
 # + rootClient - The identified root client
 # + initPattern - The initialization pattern
@@ -534,7 +534,7 @@ public function generateStructuredMetadata(
     };
 }
 
-# Extract SDK name from class information
+# Extract SDK name from class information.
 #
 # + rootClient - Root client class
 # + return - Inferred SDK name
@@ -571,7 +571,7 @@ function extractSdkNameFromClass(ClassInfo rootClient) returns string {
     return namePart + " SDK";
 }
 
-# Extract supporting classes used by the selected methods
+# Extract supporting classes used by the selected methods.
 #
 # + methods - Selected methods 
 # + allClasses - All available classes
@@ -618,7 +618,7 @@ function extractSupportingClasses(MethodInfo[] methods, ClassInfo[] allClasses)
     return supportingClasses;
 }
 
-# Check if class should be considered as client candidate
+# Check if class should be considered as client candidate.
 #
 # + cls - Class to check
 # + return - True if should be considered
@@ -646,7 +646,7 @@ function shouldConsiderAsClientCandidate(ClassInfo cls) returns boolean {
     return false;
 }
 
-# Check if Anthropic LLM is properly configured
+# Check if Anthropic LLM is properly configured.
 #
 # + return - True if configured
 function isAnthropicConfigured() returns boolean {
@@ -667,6 +667,12 @@ function isAnthropicConfigured() returns boolean {
     return false;
 }
 
+# Detect initialization pattern using LLM analysis.
+#
+# + rootClient - The identified root client class 
+# + allClasses - All classes available in the JAR (for builder hierarchy resolution)
+# + dependencyJarPaths - Paths to dependency JARs for resolving external classes
+# + return - Detected initialization pattern or error if LLM analysis fails
 function detectInitPatternWithLLM(ClassInfo rootClient, ClassInfo[] allClasses, string[] dependencyJarPaths) returns ClientInitPattern|error {
     // Use LLM for comprehensive pattern analysis if available
     if isAnthropicConfigured() {
@@ -739,7 +745,7 @@ function detectInitPatternWithLLM(ClassInfo rootClient, ClassInfo[] allClasses, 
 
 
 
-# Use LLM to intelligently rank SDK methods by usage frequency and examples
+# Use LLM to intelligently rank SDK methods by usage frequency and examples.
 #
 # + methods - Methods to rank
 # + return - Ranked methods or error
@@ -787,7 +793,7 @@ function rankMethodsUsingLLM(MethodInfo[] methods) returns MethodInfo[]|error {
     return error("Failed to rank methods using LLM");
 }
 
-# Fetch descriptions for selected methods from LLM (only for methods without descriptions)
+# Fetch descriptions for selected methods from LLM (only for methods without descriptions).
 #
 # + methods - Selected methods to get descriptions for
 # + return - Methods with descriptions added
@@ -945,7 +951,7 @@ function selectTopNMethodsWithLLM(MethodInfo[] methods, int n) returns MethodInf
     return error("Failed to call LLM for top-N method selection");
 }
 
-# Heuristic-based client initialization pattern detection
+# Heuristic-based client initialization pattern detection.
 #
 # + clientClass - The client class to analyze
 # + return - Detected initialization pattern
@@ -1007,7 +1013,7 @@ function detectClientInitPatternHeuristically(ClassInfo clientClass) returns Cli
     };
 }
 
-# Analyze fields using LLM to determine if they are required or optional
+# Analyze fields using LLM to determine if they are required or optional.
 #
 # + methodName - Method name for context
 # + parameterType - Parameter type name
@@ -1286,60 +1292,76 @@ function collectBuilderSetters(
     }
     visitedClasses[builderClass.className] = true;
 
-    // Collect fields from this class (not methods)
-    // These are the actual configuration fields stored in the builder
-    foreach FieldInfo f in builderClass.fields {
-        // Skip static fields and fields from interface definitions
-        if f.isStatic {
+    // Collect setter-style methods from this class/interface
+    // A setter method has exactly one parameter and configures some aspect of the builder.
+    // This works for both concrete builder classes AND builder interfaces.
+    foreach MethodInfo m in builderClass.methods {
+        // Must be single-param, non-static method
+        if m.isStatic || m.parameters.length() != 1 {
             continue;
         }
         
-        string fieldName = f.name;
-        
-        // Skip internal/synthetic fields
-        if fieldName.startsWith("$") || fieldName.startsWith("_") {
+        // Skip utility methods
+        string nameLower = m.name.toLowerAscii();
+        if nameLower == "build" || nameLower == "tostring" || nameLower == "hashcode" ||
+           nameLower == "equals" || nameLower == "getclass" || nameLower == "clone" ||
+           nameLower == "tobuilder" || nameLower == "frompayload" || nameLower == "wait" ||
+           nameLower == "notify" || nameLower == "notifyall" {
             continue;
         }
+
+        // Derive field name from method name
+        string fieldName = m.name;
+        // Strip common prefixes: set / with
+        if fieldName.startsWith("set") && fieldName.length() > 3 {
+            string afterPrefix = fieldName.substring(3, 4);
+            if afterPrefix == afterPrefix.toUpperAscii() {
+                fieldName = fieldName.substring(3, 4).toLowerAscii() + fieldName.substring(4);
+            }
+        } else if fieldName.startsWith("with") && fieldName.length() > 4 {
+            string afterPrefix = fieldName.substring(4, 5);
+            if afterPrefix == afterPrefix.toUpperAscii() {
+                fieldName = fieldName.substring(4, 5).toLowerAscii() + fieldName.substring(5);
+            }
+        }
+
+        // Get parameter type
+        ParameterInfo param = m.parameters[0];
         
         // Apply SDK-internal field filter
-        if shouldFilterField(fieldName, f.typeName) {
+        if shouldFilterField(fieldName, param.typeName) {
             continue;
         }
         
-        // Skip builder pattern fields and special fields
-        string nameLower = fieldName.toLowerAscii();
-        if nameLower == "result" || nameLower == "builder" || nameLower == "parent" ||
-           nameLower == "config" || fieldName.endsWith("Builder") || fieldName.endsWith("Impl") {
+        // Skip AsString/AsStrings suffixed methods (redundant converters)
+        if fieldName.endsWith("AsString") || fieldName.endsWith("AsStrings") {
             continue;
         }
         
-        // Skip if already added
+        // Skip overrideConfiguration and similar internal config methods
+        if fieldName == "overrideConfiguration" || fieldName == "applyMutation" ||
+           fieldName == "putAdvancedOption" {
+            continue;
+        }
+        
+        // Skip if already added (handles method overloads and inherited duplicates)
         if visitedFieldNames.hasKey(fieldName) {
             continue;
         }
         visitedFieldNames[fieldName] = true;
 
-        string simpleType = extractSimpleTypeName(f.typeName);
+        string simpleType = extractSimpleTypeName(param.typeName);
 
         ConnectionFieldInfo info = {
             name: fieldName,
             typeName: simpleType,
-            fullType: f.typeName,
+            fullType: param.typeName,
             isRequired: false
         };
-        if f.javadoc != () {
-            info.description = f.javadoc;
+        if m.description != () {
+            info.description = m.description;
         }
         fields.push(info);
-        
-        // Try to resolve the field type class to extract its details
-        // This helps document complex field types
-        if !isPrimitiveType(f.typeName) {
-            ClassInfo? fieldTypeClass = findOrResolveClass(f.typeName, resolvedClasses, dependencyJarPaths);
-            if fieldTypeClass is ClassInfo {
-                // We've resolved it but don't add it as a field - just ensure it's in resolvedClasses
-            }
-        }
     }
 
     // Recurse into superClass

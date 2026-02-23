@@ -274,7 +274,7 @@ public function analyzeJavaSDK(string jarPath, string outputDir, AnalyzerConfig 
     };
 }
 
-# Check if a class is relevant for client identification
+# Check if a class is relevant for client identification.
 #
 # + cls - ClassInfo to evaluate
 # + return - true if relevant, false otherwise
@@ -313,7 +313,7 @@ function isRelevantClientClass(ClassInfo cls) returns boolean {
     return publicMethodCount > 5;
 }
 
-# Detect the client initialization pattern from constructors
+# Detect the client initialization pattern from constructors.
 #
 # + clientClass - Root client ClassInfo
 # + return - Initialization pattern description
@@ -335,7 +335,7 @@ function detectClientInitPattern(ClassInfo clientClass) returns string {
     return string:'join(" | ", ...patterns);
 }
 
-# Detect the client initialization pattern from constructors returning ClientInitPattern record
+# Detect the client initialization pattern from constructors returning ClientInitPattern record.
 #
 # + clientClass - Root client ClassInfo
 # + return - ClientInitPattern record
@@ -371,7 +371,7 @@ function detectClientInitPatternRecord(ClassInfo clientClass) returns ClientInit
     };
 }
 
-# Build constructor signature
+# Build constructor signature.
 #
 # + constructor - Constructor info
 # + return - Constructor signature string
@@ -382,7 +382,7 @@ function buildConstructorSignature(ConstructorInfo constructor) returns string {
 
 
 
-# Extract SDK version from JAR path
+# Extract SDK version from JAR path.
 #
 # + jarPath - Path to JAR file
 # + return - Extracted version string
@@ -406,7 +406,7 @@ function extractSdkVersion(string jarPath) returns string {
     return "unknown";
 }
 
-# Extract simple name from full class name
+# Extract simple name from full class name.
 #
 # + fullName - Full class name
 # + return - Simple class name
@@ -415,7 +415,7 @@ function extractSimpleName(string fullName) returns string {
     return parts[parts.length() - 1];
 }
 
-# Wrapper function for JavaParser analysis
+# Wrapper function for JavaParser analysis.
 #
 # + jarPath - Path to JAR file  
 # + config - Analyzer configuration (e.g., javadocPath) to pass to the Java interop layer
@@ -446,7 +446,7 @@ public function analyzeJarWithDependencies(string jarPath, AnalyzerConfig config
     return res;
 }
 
-# Write structured metadata to file - stub implementation
+# Write structured metadata to file - stub implementation.
 #
 # + metadata - Structured metadata to write
 # + outputDir - Output directory
@@ -467,7 +467,10 @@ function writeStructuredMetadata(StructuredSDKMetadata metadata, string outputDi
     return;
 }
 
-// Escape a string for inclusion in JSON
+# Escape a string for inclusion in JSON.
+#
+# + s - Input string to escape
+# + return - Escaped string
 function escapeJsonString(string s) returns string {
     string out = "";
     int i = 0;
@@ -491,7 +494,10 @@ function escapeJsonString(string s) returns string {
     return out;
 }
 
-// Create indentation string (2 spaces per level)
+# Create indentation string (2 spaces per level).
+#
+# + level - Indentation level
+# + return - Indentation string
 function indentString(int level) returns string {
     int spaces = level * 2;
     string s = "";
@@ -501,7 +507,11 @@ function indentString(int level) returns string {
     return s;
 }
 
-// Pretty-print JSON value recursively
+# Pretty-print JSON value recursively.
+#
+# + v - JSON value to pretty-print
+# + indent - Current indentation level
+# + return - Pretty-printed JSON string
 function prettyPrintJson(json v, int indent) returns string {
     // Handle nil
     if v is () {
@@ -590,9 +600,7 @@ function prettyPrintJson(json v, int indent) returns string {
     return v.toString();
 }
 
-
-
-# Write the list of all extracted classes to a text file for offline inspection
+# Write the list of all extracted classes to a text file for offline inspection.
 #
 # + outputDir - Output directory to write the class list file
 # + rawClasses - Array of ClassInfo representing all extracted classes from the JAR
@@ -614,7 +622,7 @@ function writeClassList(string outputDir, ClassInfo[] rawClasses) returns error?
     return;
 }
 
-# Write the list of filtered classes (those considered for client identification)
+# Write the list of filtered classes (those considered for client identification).
 #
 # + outputDir - Output directory to write the class list file  
 # + filteredClasses - Array of ClassInfo representing filtered classes
